@@ -1,0 +1,5 @@
+2025/12/27-21:50:22.766 8228 Creating DB E:\graduation-project\MediaCrawler\browser_data\cdp_wb_user_data_dir\Default\Local Storage\leveldb since it was missing.
+2025/12/27-21:50:23.114 8228 Reusing MANIFEST E:\graduation-project\MediaCrawler\browser_data\cdp_wb_user_data_dir\Default\Local Storage\leveldb/MANIFEST-000001
+2025/12/27-23:30:35.609 7f80 Level-0 table #5: started
+2025/12/27-23:30:35.632 7f80 Level-0 table #5: 137317 bytes OK
+2025/12/27-23:30:35.645 7f80 Delete type=0 #3
