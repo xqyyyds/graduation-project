@@ -8,9 +8,10 @@ from pymongo import (
 )
 from typing import Any, List, Dict, Optional
 from bson.objectid import ObjectId
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import re
 from app.core.config import settings
+from app.core.logger import logger
 
 
 def _is_date_only(value: str) -> bool:
@@ -48,9 +49,9 @@ class MongoManager:
         try:
             self.client = MongoClient(settings.MONGO_URI)
             self.db = self.client[settings.MONGO_DB_NAME]
-            print("✅ MongoDB 连接成功。")
+            logger.info("✅ MongoDB 连接成功。")
         except Exception as e:
-            print(f"❌ MongoDB 连接失败: {e}")
+            logger.error(f"❌ MongoDB 连接失败: {e}")
             raise e
 
     def get_collection(self, collection_name: str):
@@ -87,7 +88,9 @@ class MongoManager:
             # 以日期差为单位计算默认 limit
             delta_days = (d2.date() - d1.date()).days + 1  # 包含结束日期
             if delta_days <= 0:
-                print("⚠️ 结束日期必须大于或等于开始日期，默认返回最近一天的数据。")
+                logger.warning(
+                    "⚠️ 结束日期必须大于或等于开始日期，默认返回最近一天的数据。"
+                )
                 delta_days = 1
 
             default_limit = delta_days * 3
@@ -97,11 +100,11 @@ class MongoManager:
                 else default_limit
             )
 
-            print(
+            logger.info(
                 f"ℹ️ 查询日期范围: {d1.isoformat(sep=' ')} 至 {d2.isoformat(sep=' ')}, 计划使用{limit}个热搜快照."
             )
         except Exception as e:
-            print(f"❌ [ETL] 日期解析错误: {e}")
+            logger.error(f"❌ [ETL] 日期解析错误: {e}")
             return []
 
         # 以空格分隔的 ISO 格式生成，与数据库中现有时间格式保持一致
@@ -117,7 +120,7 @@ class MongoManager:
             .limit(limit)
         )
         results = list(cursor)
-        print(f"✅ 获取到 {len(results)} 条热搜快照数据。")
+        logger.info(f"✅ 获取到 {len(results)} 条热搜快照数据。")
         return results
 
     def get_raw_trend_items(self, start_date: str, end_date: str) -> List[Dict]:
@@ -146,11 +149,11 @@ class MongoManager:
         保存清洗后的热度TOP事件到'events'集合
         """
         if not events:
-            print("⚠️ 无事件数据可保存。")
+            logger.warning("⚠️ 无事件数据可保存。")
             return
         self.db["events"].delete_many({})
         self.db["events"].insert_many(events)
-        print(f"✅ 已保存 {len(events)} 条核心事件数据到 'events' 集合。")
+        logger.info(f"✅ 已保存 {len(events)} 条核心事件数据到 'events' 集合。")
 
     def get_top_events(self, events: List[Dict], top_n: int = 10) -> List[Dict]:
         """
@@ -170,7 +173,7 @@ class MongoManager:
         逻辑：只要帖子的source_keyword在这个事件的关键词列表里，就是这个事件的帖子
         """
         if not keywords:
-            print("⚠️ 关键词列表为空，无法查询帖子。")
+            logger.warning("⚠️ 关键词列表为空，无法查询帖子。")
             return []
 
         query = {"source_keyword": {"$in": keywords}}
@@ -190,7 +193,7 @@ class MongoManager:
         🔥 修改点：按 'comment_like_count' 倒序排列，优先获取高赞评论。
         """
         if not note_ids:
-            print("⚠️ 帖子 note_id 列表为空，无法查询评论。")
+            logger.warning("⚠️ 帖子 note_id 列表为空，无法查询评论。")
             return []
 
         query = {"note_id": {"$in": note_ids}}
@@ -261,7 +264,9 @@ class MongoManager:
 
         if operations:
             result = self.db[collection_name].bulk_write(operations)
-            print(f"⚖️ [{collection_name}] 已回写 {result.modified_count} 条审核记录")
+            logger.info(
+                f"⚖️ [{collection_name}] 已回写 {result.modified_count} 条审核记录"
+            )
 
     def update_post_audit(self, updates: List[Dict]):
         """回写帖子的审核结果 (weibo_contents)"""

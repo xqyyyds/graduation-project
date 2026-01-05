@@ -4,13 +4,15 @@ from typing import List, Dict, Any
 # LangChain 组件
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
+
+# from langchain_core.output_parsers import JsonOutputParser (已弃用，改用 with_structured_output)
 
 # 引入联网搜索工具 (如果你没有配 Tavily，可以暂时注释掉或换成 DuckDuckGo)
 from langchain_community.tools.tavily_search import TavilySearchResults
 
 # 引入配置
 from app.core.config import settings
+from app.core.logger import logger
 
 # 🔥 引入升级后的 Schema 和 Prompts
 from app.core.schemas import PostOpinionSummary, EventAnalysisReport
@@ -32,9 +34,9 @@ class AgentOpinions:
             temperature=0.3,  # 稍微增加一点随机性以获取丰富观点
         )
 
-        # 初始化结构化解析器
-        self.map_parser = JsonOutputParser(pydantic_object=PostOpinionSummary)
-        self.reduce_parser = JsonOutputParser(pydantic_object=EventAnalysisReport)
+        # 初始化结构化解析器 (已弃用，改用 with_structured_output)
+        # self.map_parser = JsonOutputParser(pydantic_object=PostOpinionSummary)
+        # self.reduce_parser = JsonOutputParser(pydantic_object=EventAnalysisReport)
 
         # 初始化搜索工具 (用于获取官方事实)
         # 如果你没配 TAVILY_API_KEY，这里会报错，可以加 try-except
@@ -42,7 +44,7 @@ class AgentOpinions:
             self.search_tool = TavilySearchResults(max_results=3)
         except:
             self.search_tool = None
-            print("⚠️ [Agent B] Tavily 搜索工具初始化失败，将跳过联网搜索。")
+            logger.warning("⚠️ [Agent B] Tavily 搜索工具初始化失败，将跳过联网搜索。")
 
     def analyze_event(self, event_name: str, posts_data: List[Dict]) -> Dict[str, Any]:
         """
@@ -50,28 +52,29 @@ class AgentOpinions:
         :param event_name: 事件名称
         :param posts_data: 列表，每个元素必须包含 {"content": str, "comments": List[str], "media_context": str}
         """
-        print(f"🧐 [Agent B] 启动高精度舆情分析: “{event_name}”")
+        logger.info(f"🧐 [Agent B] 启动高精度舆情分析: “{event_name}”")
 
         # --- Step 1: Search (联网获取背景事实) ---
         web_context = "暂无网络背景信息"
         if self.search_tool:
-            print(f"      🌐 [Search] 正在检索背景信息...")
+            logger.info(f"      🌐 [Search] 正在检索背景信息...")
             try:
                 # 构造搜索词，确保获取官方口径
                 search_query = f"{event_name} 事件详情 官方通报"
                 search_res = self.search_tool.invoke(search_query)
                 web_context = str(search_res)
             except Exception as e:
-                print(f"      ❌ 搜索失败: {e}")
+                logger.error(f"      ❌ 搜索失败: {e}")
 
         # --- Step 2: Map (分批处理热门贴) ---
-        print(f"📊 [Agent B] 正在扫描 {len(posts_data)} 个舆论战场(热门贴)...")
+        logger.info(f"📊 [Agent B] 正在扫描 {len(posts_data)} 个舆论战场(热门贴)...")
 
-        # 预编译 Prompt 链，提高循环效率
-        map_prompt = ChatPromptTemplate.from_template(AGENT_B_MAP_TEMPLATE).partial(
-            format_instructions=self.map_parser.get_format_instructions()
-        )
-        map_chain = map_prompt | self.llm | self.map_parser
+        # 🔥 升级：使用 with_structured_output 替代 JsonOutputParser
+        # 这样更稳定，且不需要在 Prompt 里塞 format_instructions
+        structured_llm = self.llm.with_structured_output(PostOpinionSummary)
+
+        map_prompt = ChatPromptTemplate.from_template(AGENT_B_MAP_TEMPLATE)
+        map_chain = map_prompt | structured_llm
 
         map_results = []
 
@@ -81,7 +84,7 @@ class AgentOpinions:
                 summary = self._map_single_post(post, map_chain)
                 map_results.append(summary)
             except Exception as e:
-                print(f"      ⚠️ 帖子 {i+1} Map分析跳过: {e}")
+                logger.warning(f"      ⚠️ 帖子 {i+1} Map分析跳过: {e}")
                 continue
 
         if not map_results:
@@ -92,10 +95,10 @@ class AgentOpinions:
             }
 
         # --- Step 3: Reduce (深度聚合) ---
-        print(f"🧩 [Agent B] 正在聚合多维观点，生成深度报告 (Reduce)...")
+        logger.info(f"🧩 [Agent B] 正在聚合多维观点，生成深度报告 (Reduce)...")
         try:
             final_report = self._reduce_summaries(event_name, web_context, map_results)
-            print(f"✅ [Agent B] 事件 “{event_name}” 分析完成。")
+            logger.info(f"✅ [Agent B] 事件 “{event_name}” 分析完成。")
 
             # 返回字典供 State 存储
             # 如果 final_report 是 Pydantic 对象则 dump，如果是 dict 则直接返回
@@ -104,7 +107,7 @@ class AgentOpinions:
             return final_report
 
         except Exception as e:
-            print(f"❌ [Agent B] Reduce 阶段失败: {e}")
+            logger.error(f"❌ [Agent B] Reduce 阶段失败: {e}")
             return {
                 "event_overview": "报告生成异常",
                 "public_opinions": [],
@@ -124,13 +127,13 @@ class AgentOpinions:
         # 3. 提取评论 (Nodes.py 传进来的是 List[str])
         raw_comments = post_data.get("comments", [])
 
-        # 截取评论文本 (虽然数据库查了200条，但为了防止Token爆炸，
-        # 在 Prompt 里展示 100-150 条通常足够代表性，或者视模型上下文窗口而定)
-        # 这里我们保守传 100 条，或者如果用的是 GLM-4-Plus 可以传更多
+        # 截取评论文本
+        # 🔥 升级：全量保留 200 条评论，以获取最完整的舆论样本
+        # 现代 LLM (如 GLM-4, GPT-4o) 的上下文窗口足够大，无需担心 Token 溢出
         if isinstance(raw_comments, list):
-            comments_text = "\n".join([f"- {c}" for c in raw_comments[:120]])
+            comments_text = "\n".join([f"- {c}" for c in raw_comments])
         else:
-            comments_text = str(raw_comments)[:3000]  # 兜底
+            comments_text = str(raw_comments)  # 兜底
 
         # 4. 调用 LLM
         # 注意：这里的 key 必须和 prompts.py 里的 AGENT_B_MAP_TEMPLATE 槽位名一致
@@ -188,12 +191,11 @@ class AgentOpinions:
         # 拼成一个超长文本喂给 Reduce LLM
         mapped_summaries = "\n\n".join(mapped_text_list)
 
-        # 调用 LLM
-        prompt = ChatPromptTemplate.from_template(AGENT_B_REDUCE_TEMPLATE).partial(
-            format_instructions=self.reduce_parser.get_format_instructions()
-        )
+        # 🔥 升级：使用 with_structured_output 替代 JsonOutputParser
+        structured_llm = self.llm.with_structured_output(EventAnalysisReport)
 
-        chain = prompt | self.llm | self.reduce_parser
+        prompt = ChatPromptTemplate.from_template(AGENT_B_REDUCE_TEMPLATE)
+        chain = prompt | structured_llm
 
         return chain.invoke(
             {

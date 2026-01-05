@@ -34,7 +34,7 @@ class GraphState(TypedDict):
     
     # === 6. Agent D (趋势预测师) 的产出 ===
     # 🔥 修改：改为 Any 或 Dict，因为 Agent D 返回的是 TrendForecastReport 对象(字典)
-    trend_forecast: Any 
+    trend_forecast: Dict[str, Any]
     
     # === 7. Agent E (前言/最终报告) 的产出 ===
     final_report: str

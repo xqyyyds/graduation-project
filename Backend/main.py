@@ -11,12 +11,18 @@ from app.db.checkpointer import checkpointer_manager
 from app.agents.workflow import workflow
 
 
-def run_task(thread_id: str = None, start_date: str = None, end_date: str = None):
+def run_task(
+    thread_id: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    regenerate_report: bool = False,
+):
     """
     执行舆情分析全流程
     :param thread_id: 任务ID。传空则新建任务；传旧ID则断点续传。
     :param start_date: 分析开始时间 (YYYY-MM-DD HH:MM:SS)
     :param end_date: 分析结束时间
+    :param regenerate_report: 是否仅重新生成报告 (跳过前面的步骤)
     """
 
     # --- 1. ID 初始化 ---
@@ -39,6 +45,33 @@ def run_task(thread_id: str = None, start_date: str = None, end_date: str = None
 
         # 🔥 关键：在这里把 workflow 编译成可运行的 app，并挂载记忆
         app = workflow.compile(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # --- 🔥 特殊功能：仅重新生成报告 ---
+        if regenerate_report:
+            if not thread_id:
+                print("❌ 错误：使用 --regenerate_report 必须提供 --id 参数")
+                return
+
+            print(f"📝 [System] 检测到重新生成报告指令，正在读取缓存状态...")
+            snapshot = app.get_state(config)
+            if not snapshot.values:
+                print("❌ 错误：未找到该任务的有效缓存状态，无法生成报告。")
+                return
+
+            print("✅ 缓存读取成功，正在调用 Agent E...")
+            # 动态导入避免循环引用
+            from app.agents.nodes import agent_e_node
+
+            try:
+                agent_e_node(snapshot.values)
+                print(f"✨✨ 报告重新生成完毕！ ✨✨")
+            except Exception as e:
+                print(f"❌ 报告生成失败: {e}")
+                import traceback
+
+                traceback.print_exc()
+            return
 
         # --- 3. 准备初始状态 ---
         # LangGraph 的机制：
@@ -122,25 +155,53 @@ if __name__ == "__main__":
         "--days", type=int, help="分析过去多少天的数据 (默认1天)", default=1
     )
     parser.add_argument(
-        "--start", type=str, help="开始时间 YYYY-MM-DD HH:MM:SS", default=None
+        "--start",
+        type=str,
+        help="开始日期 YYYY-MM-DD（可选，只接受日期格式）",
+        default=None,
     )
     parser.add_argument(
-        "--end", type=str, help="结束时间 YYYY-MM-DD HH:MM:SS", default=None
+        "--end",
+        type=str,
+        help="结束日期 YYYY-MM-DD（可选，只接受日期格式）",
+        default=None,
+    )
+    parser.add_argument(
+        "--regenerate_report",
+        action="store_true",
+        help="【断点陨星】仅重新生成报告（需配合 --id 使用），跳过前面所有步骤，直接读取缓存。",
     )
 
     args = parser.parse_args()
 
-    # 处理时间逻辑
+    # 处理时间逻辑（统一为日期 YYYY-MM-DD）
     s_date, e_date = args.start, args.end
 
-    # 如果没指定具体的 start/end，但指定了 days，则自动计算
+    # 如果没指定具体的 start/end，但指定了 days，则自动计算日期区间（只保留日期部分）
     if not s_date and not e_date:
-        now = datetime.datetime.now().astimezone()
-        # 使用带时区的字符串，和数据库中时间格式一致（例如: 2025-12-27 21:50:20+08:00）
-        e_date = now.isoformat(sep=" ")
-        s_date = (
-            (now - datetime.timedelta(days=args.days)).astimezone().isoformat(sep=" ")
-        )
+        today = datetime.datetime.now().date()
+        e_date = today.isoformat()
+        s_date = (today - datetime.timedelta(days=args.days)).isoformat()
+
+    # 严格校验用户输入：只接受 YYYY-MM-DD
+    import re
+
+    def _validate_date(d: str) -> str:
+        if not d:
+            return d
+        d = d.strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            print(f"❌ 日期格式错误（应为 YYYY-MM-DD）：{d}")
+            sys.exit(1)
+        return d
+
+    s_date = _validate_date(s_date)
+    e_date = _validate_date(e_date)
 
     # 🚀 启动！
-    run_task(thread_id=args.id, start_date=s_date, end_date=e_date)
+    run_task(
+        thread_id=args.id,
+        start_date=s_date,
+        end_date=e_date,
+        regenerate_report=args.regenerate_report,
+    )

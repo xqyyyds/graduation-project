@@ -8,6 +8,7 @@ from langchain_core.output_parsers import JsonOutputParser
 
 # 引入配置和数据库
 from app.core.config import settings
+from app.core.logger import logger
 from app.db.chroma_manager import chroma_db
 
 # 🔥 引入分离出去的 Schema 和 Prompt
@@ -36,15 +37,14 @@ class AgentCompliance:
             openai_api_base=settings.LLM_BASE_URL,  # 这里的 URL 必须是智谱的地址
             temperature=0.1,
         )
-        # 单条模式解析器
+        # 单条模式解析器 (Legacy)
         self.parser = JsonOutputParser(pydantic_object=AuditAnalysis)
-        # 批量模式解析器
-        self.batch_parser = JsonOutputParser(pydantic_object=BatchComplianceResult)
 
-        # Batch+RAG 证据链解析器
-        self.evidence_parser = JsonOutputParser(
-            pydantic_object=ComplianceEvidenceReport
-        )
+        # 批量模式解析器 (已弃用，改用 with_structured_output)
+        # self.batch_parser = JsonOutputParser(pydantic_object=BatchComplianceResult)
+
+        # Batch+RAG 证据链解析器 (已弃用，改用 with_structured_output)
+        # self.evidence_parser = JsonOutputParser(pydantic_object=ComplianceEvidenceReport)
 
         # 完整的标签列表 (保留用于单条模式的 RAG 检索或参考)
         self.valid_categories = [
@@ -121,21 +121,23 @@ class AgentCompliance:
         :param note_id: 帖子真实 ID (用于 Prompt 上下文)
         :return: BatchComplianceResult 对象
         """
-        print(f"👮 [Agent C] 正在进行批量审查 (Batch Audit) ID: {note_id}...")
+        logger.info(f"👮 [Agent C] 正在进行批量审查 (Batch Audit) ID: {note_id}...")
 
         # 1. 组装 Prompt
-        prompt = ChatPromptTemplate.from_template(AGENT_C_BATCH_TEMPLATE).partial(
-            format_instructions=self.batch_parser.get_format_instructions()
-        )
+        # 🔥 升级：使用 with_structured_output，不再需要 format_instructions
+        structured_llm = self.llm.with_structured_output(BatchComplianceResult)
+        prompt = ChatPromptTemplate.from_template(AGENT_C_BATCH_TEMPLATE)
 
         # 2. 构造链
-        chain = prompt | self.llm | self.batch_parser
+        chain = prompt | structured_llm
 
         try:
             # 3. 调用 LLM
             # 🔥 关键修改：传入真实的 note_id 给 Prompt 里的 {post_id}
-            res_dict = chain.invoke(
+            # 🔥 注入 categories 列表供 LLM 选择
+            res_obj = chain.invoke(
                 {
+                    "categories": ", ".join(self.valid_categories),
                     "post_id": note_id,
                     "post_content": post_content,
                     "media_context": media_context,
@@ -143,15 +145,13 @@ class AgentCompliance:
                 }
             )
 
-            # 4. 转换为 Pydantic 对象返回
-            return BatchComplianceResult(**res_dict)
+            # 4. 转换为 Pydantic 对象返回 (with_structured_output 直接返回对象)
+            return res_obj
 
         except Exception as e:
-            print(f"❌ [Agent C] Batch Audit Error (ID: {note_id}): {e}")
+            logger.error(f"❌ [Agent C] Batch Audit Error (ID: {note_id}): {e}")
             # 出错时返回默认的安全结果
-            return BatchComplianceResult(
-                is_post_violated=False, violated_comments=[], overall_risk_level="Low"
-            )
+            return BatchComplianceResult(is_post_violated=False, violated_comments=[])
 
     def batch_audit_with_rag(
         self,
@@ -199,30 +199,65 @@ class AgentCompliance:
                 categories.append(cat)
 
         # 2) Chroma 检索（按标签过滤，保证命中条款可解释）
+        # 🔥 升级：同时回填 risk_level 到 violated_items
         matched_laws: List[Dict[str, Any]] = []
+
+        # 建立 category -> risk_level 的映射缓存
+        cat_risk_map = {}
+
         for cat in categories:
             try:
+                # 拿 category 去搜，获取最匹配的条款
                 docs = chroma_db.search_related_laws(
                     query=cat,
                     top_k=top_k_per_category,
                     category_filter=cat,
                 )
             except Exception as e:
-                print(f"⚠️ [Agent C] RAG 检索失败 (category={cat}): {e}")
+                logger.warning(f"⚠️ [Agent C] RAG 检索失败 (category={cat}): {e}")
                 docs = []
 
             for d in docs or []:
                 meta = getattr(d, "metadata", {}) or {}
+                risk = meta.get("risk_level", meta.get("risk", "Low"))
+
+                # 记录映射
+                if cat not in cat_risk_map:
+                    cat_risk_map[cat] = risk
+                elif risk == "High":  # 如果有 High，优先覆盖
+                    cat_risk_map[cat] = "High"
+
                 matched_laws.append(
                     {
                         "category": meta.get("category", cat),
                         "article": meta.get("article", "未知"),
-                        "risk_level": meta.get(
-                            "risk_level", meta.get("risk", "Unknown")
-                        ),
+                        "risk_level": risk,
                         "rule": getattr(d, "page_content", "") or "",
                     }
                 )
+
+        # 🔥 回填 risk_level 到 violated_items
+        max_risk_val = 0  # 0:Low, 1:Medium, 2:High
+        risk_val_map = {"Low": 0, "Medium": 1, "High": 2, "None": 0}
+
+        for item in violated_items:
+            cat = item.get("category")
+            # 从 RAG 结果中查找 risk，找不到默认 Low
+            found_risk = cat_risk_map.get(cat, "Low")
+            item["risk_level"] = found_risk
+
+            # 计算整体风险
+            current_val = risk_val_map.get(found_risk, 0)
+            if current_val > max_risk_val:
+                max_risk_val = current_val
+
+        # 回填整体风险
+        final_overall_risk = "Low"
+        if max_risk_val == 1:
+            final_overall_risk = "Medium"
+        if max_risk_val == 2:
+            final_overall_risk = "High"
+        batch_dict["overall_risk_level"] = final_overall_risk
 
         # 限制条款数量，防止 token 膨胀
         if len(matched_laws) > 12:
@@ -230,22 +265,20 @@ class AgentCompliance:
 
         # 3) 生成证据链（结构化 JSON）
         try:
-            # 截断违规项，避免 token 爆炸
-            violated_items_trimmed = violated_items[:20]
+            # 🔥 修正：移除截断，确保生成完整的证据链
+            # violated_items_trimmed = violated_items[:20]
 
-            prompt = ChatPromptTemplate.from_template(
-                AGENT_C_EVIDENCE_TEMPLATE
-            ).partial(
-                format_instructions=self.evidence_parser.get_format_instructions()
-            )
-            chain = prompt | self.llm | self.evidence_parser
+            # 🔥 升级：使用 with_structured_output
+            structured_llm = self.llm.with_structured_output(ComplianceEvidenceReport)
+            prompt = ChatPromptTemplate.from_template(AGENT_C_EVIDENCE_TEMPLATE)
+            chain = prompt | structured_llm
 
             evidence_obj = chain.invoke(
                 {
                     "post_content": post_content,
                     "media_context": media_context,
                     "violated_items_json": json.dumps(
-                        violated_items_trimmed, ensure_ascii=False
+                        violated_items, ensure_ascii=False
                     ),
                     "laws_json": json.dumps(matched_laws, ensure_ascii=False),
                 }
@@ -255,8 +288,11 @@ class AgentCompliance:
                 if hasattr(evidence_obj, "model_dump")
                 else dict(evidence_obj)
             )
+            # 🔥 回填整体风险等级 (由 Python 计算，而非 LLM 生成)
+            evidence_report["overall_risk_level"] = final_overall_risk
+
         except Exception as e:
-            print(f"⚠️ [Agent C] 证据链生成失败 (ID: {note_id}): {e}")
+            logger.warning(f"⚠️ [Agent C] 证据链生成失败 (ID: {note_id}): {e}")
             evidence_report = {}
 
         return {
@@ -278,7 +314,7 @@ class AgentCompliance:
         """
         (Legacy) 执行单条审查流程：Thinking -> Retrieval -> Verdict
         """
-        print(f"👮 [Agent C] 单条审查: “{text[:20]}...”")
+        logger.info(f"👮 [Agent C] 单条审查: “{text[:20]}...”")
 
         # 1. 定性分析
         analysis_chain = self._get_analysis_prompt() | self.llm | self.parser

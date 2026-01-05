@@ -18,6 +18,10 @@ class Settings:
 
     # 数据库设置
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+
+    # 日志设置
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "media_crawler_db")
     CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 
@@ -26,12 +30,3 @@ class Settings:
 
 
 settings = Settings()
-
-# 不在 import 阶段强制退出：允许在不启用 LLM/RAG 的情况下做本地调试与静态检查。
-if not settings.ZHIPU_API_KEY:
-    print("⚠️ 警告：未设置 ZHIPU_API_KEY，LLM 相关功能将不可用。")
-if not settings.LLM_BASE_URL:
-    print("⚠️ 警告：未设置 LLM_BASE_URL，LLM 相关功能可能不可用。")
-if not settings.BAAI_API_KEY:
-    print("⚠️ 警告：未设置 BAAI_API_KEY，向量检索（Chroma Embedding）将不可用。")
-print("✅ 配置文件加载成功。")

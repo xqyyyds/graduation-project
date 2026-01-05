@@ -12,18 +12,25 @@ class MergedEvent(BaseModel):
     """定义单个归并后的事件结构"""
 
     event_name: str = Field(
-        ..., description="归并后的事件名称，要求简短、客观、标准，不带#号"
+        ...,
+        description="归并后的标准事件名称。必须是客观中立的新闻标题风格（主谓宾结构），严禁包含情绪化词汇、饭圈用语及'#'符号。",
     )
-    keywords: List[str] = Field(..., description="属于该事件的所有原始热搜词列表")
+    keywords: List[str] = Field(
+        ...,
+        description="必须严格从输入的【待处理列表】中复制原始词条，严禁修改任何字符（包括空格、标点）。",
+    )
     reasoning: str = Field(
-        ..., description="简要说明为什么将这些词归为一类，例如'均讨论小洛熙事件'"
+        ...,
+        description="归并理由。简述这些词条共同指向的核心实体或事件锚点（例如：'均涉及某明星的某具体争议事件'）。",
     )
 
 
 class EventList(BaseModel):
     """定义最终输出的列表容器"""
 
-    events: List[MergedEvent] = Field(description="归并后的事件列表")
+    events: List[MergedEvent] = Field(
+        description="归并后的独立事件列表。确保输入的所有热搜词都被包含在内，无遗漏。"
+    )
 
 
 # =====================================================
@@ -49,10 +56,10 @@ class PostOpinionSummary(BaseModel):
     """
 
     opinion_clusters: List[OpinionCluster] = Field(
-        description="提取出的3-5个主要观点阵营及其占比"
+        description="提取出的主要观点阵营（1-5个，视实际舆论分歧程度而定）及其占比"
     )
     conflict_analysis: str = Field(
-        description="评论区是否存在骂战或对立？简要描述冲突点。"
+        description="分析评论区的舆论对立程度。若存在激烈争论或群体冲突，请指出核心矛盾点；若氛围和谐，填'无'。"
     )
 
 
@@ -68,17 +75,17 @@ class EventAnalysisReport(BaseModel):
 
     # 1. 事实层
     event_overview: str = Field(
-        description="【事件概述】客观还原时间、地点、经过、官方通报结果。"
+        description="【事件概述】必须以新闻调查记者的笔触，高密度还原核心事实（关键时间节点、冲突爆发点、官方通报）。"
     )
 
     # 2. 观点层
     public_opinions: List[str] = Field(
-        description="【舆论观点】分点列出(如: 一是...; 二是...)，需体现不同阵营的声音。"
+        description="【舆论观点】必须分层级梳理：1.主流声浪 2.次生质疑 3.深层情绪 4.对立博弈。每一点作为列表的一项。"
     )
 
     # 3. 深度层
     depth_analysis: str = Field(
-        description="【舆情分析】深度的社会归因 (如: 留学生管理体制、资源公平焦虑等)。"
+        description="【舆情分析】必须进行社会学归因。覆盖：社会痛点映射、群体心理画像、制度与治理反思。"
     )
 
 
@@ -118,9 +125,18 @@ class ViolatedItem(BaseModel):
         description="违规内容在输入列表中的序号 (主贴填 -1，评论填对应的序号 0,1,2...)",
     )
     content_snippet: str = Field(..., description="违规内容的原文片段 (用于存证)")
-    category: str = Field(..., description="违规类别 (如: 政治敏感, 色情, 暴恐, 谩骂)")
-    risk_level: str = Field(..., description="风险等级 (High/Medium/Low)")
-    reasoning: str = Field(..., description="判定违规的具体理由")
+    quote: str = Field(
+        ...,
+        description="【精准摘录】违规的核心词汇或句子（如：'zf'、'杀'、'造谣内容'）。",
+    )
+    category: str = Field(
+        ...,
+        description="违规类别，必须严格从提供的【可选违规大类】列表中选择，不得自造。",
+    )
+    reasoning: str = Field(
+        ...,
+        description="判定理由。格式必须为 '违规标签: 具体原因' (例如 '时政有害-国家安全: 涉及...')。",
+    )
 
 
 # 🔥 [新增] Batch 模式专用：整体审查结果
@@ -131,10 +147,7 @@ class BatchComplianceResult(BaseModel):
 
     is_post_violated: bool = Field(..., description="主贴本身是否违规")
     violated_comments: List[ViolatedItem] = Field(
-        ..., description="违规的评论列表，若无违规，返回空列表"
-    )
-    overall_risk_level: str = Field(
-        ..., description="当前这组内容的整体风险等级 (High/Medium/Low)"
+        ..., description="违规的评论列表。仅包含确认为违规的项。"
     )
 
 
@@ -155,7 +168,6 @@ class LawReference(BaseModel):
 class ComplianceEvidenceReport(BaseModel):
     """对一条帖子（含评论列表）的合规判决书/证据链（用于回写数据库与报告引用）"""
 
-    overall_risk_level: str = Field(..., description="综合风险等级（High/Medium/Low）")
     violated_categories: List[str] = Field(..., description="本次命中的违规标签列表")
     cited_laws: List[LawReference] = Field(
         ..., description="命中的法规/公约条款（来自 Chroma 检索）"
@@ -166,6 +178,9 @@ class ComplianceEvidenceReport(BaseModel):
     reasoning: str = Field(
         ..., description="违规原因分析（合并解释：为何构成违规、危害是什么）"
     )
+    disposal_suggestion: str = Field(
+        ..., description="处置建议（如：建议删除评论、建议封禁账号、建议上报网信办等）"
+    )
 
 
 # =====================================================
@@ -173,39 +188,42 @@ class ComplianceEvidenceReport(BaseModel):
 # =====================================================
 
 
-class RiskFocusArea(BaseModel):
-    """单项风险预测"""
+class ForecastPoint(BaseModel):
+    """单个风险点或建议点"""
 
-    domain: str = Field(
-        ..., description="风险领域名称 (如: 文旅消费、公共安全、基层治理)"
-    )
-    deduction_logic: str = Field(
+    subtitle: str = Field(
         ...,
-        description="【风险成因推演】必须体现'当下情绪'与'未来节点'的叠加效应。",
+        description="子标题，格式如：'（一）跨区域标准不一易引发争议' 或 '（二）警惕政策调整忽视从业者权益'",
     )
-    warning_keywords: List[str] = Field(
+    content: str = Field(
+        ..., description="详细内容。包含风险描述、案例引用（如有）及具体的防范建议。"
+    )
+
+
+class ForecastTopic(BaseModel):
+    """预测报告的一个核心议题板块"""
+
+    topic_name: str = Field(
         ...,
-        description="预测可能上热搜的3-5个具体敏感词",
+        description="议题标题，采用动宾结构或对仗句式，如：'如何打好烟花爆竹管控攻坚战，考验政府治理能力' 或 '推动矛盾纠纷化解，维护基层社会和谐稳定'",
+    )
+    background: str = Field(
+        ...,
+        description="背景导语。简述该议题的宏观背景、时间节点特征（如'元旦春节临近...'）。",
+    )
+    points: List[ForecastPoint] = Field(
+        ..., description="该议题下的具体风险点列表（通常3-5点）。"
     )
 
 
 class TrendForecastReport(BaseModel):
-    """Agent D 的最终产出"""
+    """Agent D 的最终产出 (Government Report Style)"""
 
     target_month: str = Field(..., description="研判的目标月份 (如: '2026年1月')")
 
-    overall_judgment: str = Field(
+    topics: List[ForecastTopic] = Field(
         ...,
-        description="【总体研判】用一段极具洞察力的话，概括下个月的舆情压力等级与核心矛盾。",
-    )
-
-    top_risks: List[RiskFocusArea] = Field(
-        ..., description="【重点风险前瞻】列出 3 个最可能爆发的风险领域。"
-    )
-
-    strategic_advice: List[str] = Field(
-        ...,
-        description="【决策锦囊】3条高维度的治理建议。",
+        description="【核心议题预测】列出 3-4 个下个月最需要关注的舆情风险议题。每个议题包含背景和若干具体风险点。",
     )
 
 
@@ -217,22 +235,31 @@ class TrendForecastReport(BaseModel):
 class PrefaceSection(BaseModel):
     """前言部分的完整结构"""
 
-    # 🔥 [补全] 之前漏掉的 report_period，生成报告时必须用到
     report_period: str = Field(
         ..., description="报告覆盖及研判周期 (如: '2025年10月回顾及11月前瞻')"
     )
 
-    macro_phenomenon: str = Field(
+    overview: str = Field(
         ...,
-        description="【宏观现象】总结这段时间舆情的总体特点（如：高度碎片化、信任危机频发等）。",
+        description="【开篇综述】简述时间跨度、涉及范围及核心议题概览（如：'从10月底至11月，全国各地高校的相关舆情频繁出现...'）。",
     )
 
-    compliance_analysis: str = Field(
+    characteristics: List[str] = Field(
         ...,
-        description="【底线审视】概括违规内容的特征。是谣言为主？还是非理性宣泄？",
+        description="【特征分析】提炼三个核心特征（其一、其二、其三）。每点必须包含：现象描述 + 深度归因（如：'敏感性显著提升'、'议题碎片化'、'负面标签固化'）。",
     )
 
-    future_abstraction: str = Field(
+    compliance_perspective: str = Field(
         ...,
-        description="【趋势承接】结合当下与历史，对未来做一个概括性预判。",
+        description="【违规透视】基于合规数据，分析舆论场的非理性程度（如：谣言传播、情绪宣泄、群体极化）。",
+    )
+
+    trend_connection: str = Field(
+        ...,
+        description="【时空承接】结合当下情绪与历史规律，对未来做一个结论性概括，并引导读者阅读正文。",
+    )
+
+    conclusion: str = Field(
+        ...,
+        description="【结语】总体研判与宏观治理建议（如：'总体来看，当下舆情环境的脆弱性呈现强化趋势...'）。",
     )

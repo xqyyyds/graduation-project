@@ -1,11 +1,8 @@
 import logging
 from app.core.config import settings
+from app.core.logger import logger
 
 from langchain_community.tools.tavily_search import TavilySearchResults
-
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 def get_web_context(query: str) -> str:
@@ -20,7 +17,7 @@ def get_web_context(query: str) -> str:
     if not settings.TAVILY_API_KEY:
         return "（系统提示：未配置 TAVILY_API_KEY，无法进行联网搜索）"
 
-    print(f"🌍 [Tools] 正在全网深度搜索: “{query}” ...")
+    logger.info(f"🌍 [Tools] 正在全网深度搜索: “{query}” ...")
 
     try:
         # 1. 初始化工具 (每次调用时初始化，无状态，轻量级)

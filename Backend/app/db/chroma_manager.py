@@ -6,6 +6,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
 from app.core.config import settings
+from app.core.logger import logger
 
 
 class ChromaManager:
@@ -25,7 +26,7 @@ class ChromaManager:
             self._init_vector_store()
         except Exception as e:
             # 不阻塞启动：RAG 会降级为空结果
-            print(f"⚠️ [ChromaDB] 向量库未启用（将降级为空检索）: {e}")
+            logger.warning(f"⚠️ [ChromaDB] 向量库未启用（将降级为空检索）: {e}")
 
     def _init_vector_store(self):
         """按需初始化向量库；允许在缺配置时延迟失败。"""
@@ -51,7 +52,7 @@ class ChromaManager:
             embedding_function=self.embedding_fn,
             collection_name="weibo_audit_rules",
         )
-        print(f"✅ [ChromaDB] 向量库加载成功，路径: {self.persist_dir}")
+        logger.info(f"✅ [ChromaDB] 向量库加载成功，路径: {self.persist_dir}")
 
     def add_documents(self, documents: List[Document]):
         """
@@ -60,14 +61,14 @@ class ChromaManager:
         if not documents:
             return
 
-        print(
+        logger.info(
             f"📥 [ChromaDB] 正在写入 {len(documents)} 条数据 (Model: {settings.EMBEDDING_MODEL})..."
         )
         try:
             self.vector_store.add_documents(documents)
-            print("✅ [ChromaDB] 写入完成")
+            logger.info("✅ [ChromaDB] 写入完成")
         except Exception as e:
-            print(f"❌ [ChromaDB] 写入失败 (可能是网络或Key的问题): {e}")
+            logger.error(f"❌ [ChromaDB] 写入失败 (可能是网络或Key的问题): {e}")
 
     def search_related_laws(
         self, query: str, top_k: int = 3, category_filter: str = None
@@ -84,7 +85,7 @@ class ChromaManager:
 
             # 1. 如果有标签过滤器，使用 metadata 过滤
             if category_filter:
-                print(f"🎯 [RAG] 启用精准过滤: category == '{category_filter}'")
+                logger.info(f"🎯 [RAG] 启用精准过滤: category == '{category_filter}'")
                 # Chroma 的 filter 语法: where={"key": "value"}
                 # 这里的 query 依然可以用，会在过滤后的范围内再做一次相似度排序
                 return self.vector_store.similarity_search(
@@ -96,7 +97,7 @@ class ChromaManager:
                 return self.vector_store.similarity_search(query, k=top_k)
 
         except Exception as e:
-            print(f"⚠️ [RAG] 检索出错: {e}")
+            logger.error(f"⚠️ [RAG] 检索出错: {e}")
             return []
 
     def clear_db(self):
@@ -107,7 +108,7 @@ class ChromaManager:
         if self.vector_store is None:
             return
 
-        print("⚠️ [ChromaDB] 正在清空现有规则...")
+        logger.warning("⚠️ [ChromaDB] 正在清空现有规则...")
         try:
             # 1. 获取库里所有数据的 ID
             all_data = self.vector_store.get()
@@ -116,12 +117,12 @@ class ChromaManager:
             # 2. 如果有数据，就根据 ID 全部删除
             if ids:
                 self.vector_store.delete(ids=ids)
-                print(f"🗑️ [ChromaDB] 已清除 {len(ids)} 条历史数据")
+                logger.info(f"🗑️ [ChromaDB] 已清除 {len(ids)} 条历史数据")
             else:
-                print("🗑️ [ChromaDB] 数据库已经是空的，无需清理")
+                logger.info("🗑️ [ChromaDB] 数据库已经是空的，无需清理")
 
         except Exception as e:
-            print(f"⚠️ [ChromaDB] 清理过程遇到错误 (可忽略): {e}")
+            logger.error(f"⚠️ [ChromaDB] 清理过程遇到错误 (可忽略): {e}")
 
 
 # 单例导出
