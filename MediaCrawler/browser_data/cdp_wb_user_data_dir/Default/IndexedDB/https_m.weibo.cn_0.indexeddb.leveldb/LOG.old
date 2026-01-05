@@ -1,6 +1,0 @@
-2025/12/27-21:57:22.748 8370 Creating DB E:\graduation-project\MediaCrawler\browser_data\cdp_wb_user_data_dir\Default\IndexedDB\https_m.weibo.cn_0.indexeddb.leveldb since it was missing.
-2025/12/27-21:57:22.791 8370 Reusing MANIFEST E:\graduation-project\MediaCrawler\browser_data\cdp_wb_user_data_dir\Default\IndexedDB\https_m.weibo.cn_0.indexeddb.leveldb/MANIFEST-000001
-2025/12/27-23:31:06.023 8370 Level-0 table #5: started
-2025/12/27-23:31:06.034 8370 Level-0 table #5: 7265 bytes OK
-2025/12/27-23:31:06.045 8370 Delete type=0 #3
-2025/12/27-23:31:06.046 8370 Manual compaction at level-0 from (begin) .. (end); will stop at (end)

@@ -1,2 +1,9 @@
 /MediaCrawler
 /Backend/.env
+
+# 常见忽略项（可选）
+__pycache__/
+*.pyc
+*.log
+.env
+node_modules/
