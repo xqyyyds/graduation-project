@@ -1,7 +1,9 @@
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
+import concurrent.futures
 from dateutil.relativedelta import relativedelta
 from app.core.logger import logger
+from app.core.config import settings
 
 # 1. 引入同级目录下的 State
 from app.agents.state import GraphState
@@ -38,7 +40,19 @@ def etl_node(state: GraphState) -> Dict[str, Any]:
         events = event_merger.run_merge_task(start_str, end_str)
         if not events:
             return {"core_events": [], "current_step": "ETL_Empty"}
-        return {"core_events": events, "current_step": "ETL_Done"}
+
+        # 🔥 确保 etl_node 输出的数据是干净的 (无 ObjectId)
+        clean_events = []
+        for e in events:
+            # 如果是 Pydantic 对象，dump 之；如果是 dict，直接用
+            d = e.model_dump() if hasattr(e, "model_dump") else dict(e)
+            if "_id" in d and d["_id"]:
+                d["_id"] = str(d["_id"])
+            if "id" in d and d["id"] and not isinstance(d["id"], str):
+                d["id"] = str(d["id"])
+            clean_events.append(d)
+
+        return {"core_events": clean_events, "current_step": "ETL_Done"}
     except Exception as e:
         logger.error(f"   ❌ [Node ETL] Error: {e}")
         return {"core_events": [], "current_step": "ETL_Error"}
@@ -55,111 +69,261 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
 
 # =====================================================
 # Node B: 数据提取与深度分析 (B承担"搬运工")
+# 🔥 重构：使用 LLM 判断事件是否重复，确保分析 5 个不同事件
 # =====================================================
 def agent_b_node(state: GraphState) -> Dict[str, Any]:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+    from app.core.schemas import EventDuplicateCheck
+    from app.core.prompts import EVENT_DUPLICATE_CHECK_PROMPT
+
     # --- 配置参数 ---
-    FETCH_EVENT_COUNT = 10  # 为前 10 个事件抓取数据 (供合规审查)
-    ANALYZE_EVENT_COUNT = 5  # 为前 5 个事件做深度观点分析 (节省 Token)
+    FETCH_EVENT_COUNT = 20  # 🔥 前 20 个事件抓取数据 (供合规审查)
+    ANALYZE_EVENT_COUNT = 5  # 🔥 必须分析 5 个不同事件
     POSTS_PER_EVENT = 15  # 每个事件取 Top 15 帖子
     COMMENTS_PER_POST = 200  # 每个帖子取 200 条评论
 
     logger.info(
-        f"\n🧐 [Node B] 启动：数据提取 (Top {FETCH_EVENT_COUNT}) & 深度分析 (Top {ANALYZE_EVENT_COUNT})..."
+        f"\n🧐 [Node B] 启动：数据提取 (Top {FETCH_EVENT_COUNT}) & 深度分析 (必须 {ANALYZE_EVENT_COUNT} 个不同事件)..."
     )
 
     all_events = state.get("core_events", [])
     if not all_events:
         return {"analyzed_events": [], "current_step": "B_Skipped"}
 
-    # 仅处理前 N 个事件，后面的直接保留原样
+    # 仅处理前 N 个事件
     target_events = all_events[:FETCH_EVENT_COUNT]
-    remaining_events = all_events[FETCH_EVENT_COUNT:]
 
-    analyzed_results = []  # 存放有深度报告的事件
-    processed_events = []  # 存放处理过数据的所有事件 (含 Top 10)
+    start_date = (state.get("start_date") or "").strip()
+    end_date = (state.get("end_date") or "").strip()
 
-    for i, event in enumerate(target_events):
-        event_name = event.get("event_name", "未知")
-        keywords = event.get("related_keywords", [])
+    # -------------------------------------------------------------------------
+    # 初始化去重用的 LLM
+    # -------------------------------------------------------------------------
+    dedup_llm = ChatOpenAI(
+        model=settings.LLM_MODEL,
+        openai_api_key=settings.ZHIPU_API_KEY,
+        openai_api_base=settings.LLM_BASE_URL,
+        temperature=0.1,
+        request_timeout=60,
+        max_retries=2,
+    )
+    structured_dedup_llm = dedup_llm.with_structured_output(EventDuplicateCheck)
+    dedup_prompt = ChatPromptTemplate.from_template(EVENT_DUPLICATE_CHECK_PROMPT)
 
-        # 1. 查帖子 (Top N)
-        raw_posts = mongo_db.get_posts_by_keywords(keywords, limit=POSTS_PER_EVENT)
+    # -------------------------------------------------------------------------
+    # 辅助函数：获取单个事件的帖子数据
+    # -------------------------------------------------------------------------
+    def fetch_event_posts(event):
+        """只负责抓取数据，不做分析"""
+        try:
+            keywords = event.get("related_keywords", [])
+            raw_posts = mongo_db.get_posts_by_keywords(keywords, limit=POSTS_PER_EVENT)
 
-        valid_posts_data = []
-        for p in raw_posts or []:
-            note_id = str(p.get("note_id", ""))
-            if not note_id:
-                continue
+            valid_posts_data = []
+            for p in raw_posts or []:
+                note_id = str(p.get("note_id", ""))
+                if not note_id:
+                    continue
 
-            # 获取全量评论
-            comments = mongo_db.get_comments_by_post_ids(
-                [note_id], limit=COMMENTS_PER_POST
+                comments = mongo_db.get_comments_by_post_ids(
+                    [note_id], limit=COMMENTS_PER_POST
+                )
+
+                comment_texts = []
+                comment_items = []
+                for c in comments or []:
+                    if not isinstance(c, dict):
+                        continue
+                    content = (c.get("content") or "").strip()
+                    if not content:
+                        continue
+                    comment_texts.append(content)
+                    comment_items.append({"db_id": c.get("_id"), "content": content})
+
+                image_list_raw = p.get("image_list", "") or ""
+                image_urls = [u.strip() for u in image_list_raw.split(",") if u.strip()]
+                video_url = p.get("video_url", "") or ""
+
+                media_context = ""
+                if image_urls:
+                    media_context += f"【图片链接】{', '.join(image_urls)}\n"
+                if video_url:
+                    media_context += f"【视频链接】{video_url}"
+
+                post_packet = {
+                    "note_id": note_id,
+                    "db_id": str(p.get("_id")) if p.get("_id") else "",
+                    "content": p.get("full_content") or p.get("content", ""),
+                    "comments": comment_texts,
+                    "comment_items": [
+                        (
+                            {**item, "db_id": str(item["db_id"])}
+                            if item.get("db_id")
+                            else item
+                        )
+                        for item in comment_items
+                    ],
+                    "media_context": media_context,
+                    "audit_status": p.get("audit_status"),
+                }
+                valid_posts_data.append(post_packet)
+
+            return valid_posts_data
+        except Exception as e:
+            logger.error(f"❌ [Node B] 数据抓取失败: {e}")
+            return []
+
+    # -------------------------------------------------------------------------
+    # 🔥 辅助函数：使用 LLM 检测事件是否与已分析事件重复
+    # -------------------------------------------------------------------------
+    def is_duplicate_event_llm(event_name: str, analyzed_names: list) -> bool:
+        """
+        使用 LLM 判断当前事件是否与已分析的事件是同一新闻事件
+        如"小洛熙"与"小洛熙妈妈"、"马杜罗"与"委内瑞拉局势"
+        """
+        if not analyzed_names:
+            return False
+
+        try:
+            chain = dedup_prompt | structured_dedup_llm
+            result = chain.invoke(
+                {
+                    "current_event": event_name,
+                    "analyzed_events": ", ".join(analyzed_names),
+                }
             )
 
-            comment_texts = []
-            comment_items = []
-            for c in comments or []:
-                if not isinstance(c, dict):
-                    continue
-                content = (c.get("content") or "").strip()
-                if not content:
-                    continue
-                comment_texts.append(content)
-                comment_items.append({"db_id": c.get("_id"), "content": content})
+            if result and result.is_same_event:
+                logger.info(
+                    f"   ⏭️ [LLM去重] 跳过重复事件: {event_name}\n"
+                    f"      理由: {result.reasoning}"
+                )
+                return True
+            else:
+                logger.info(f"   ✅ [LLM去重] {event_name} 是独立事件")
+                return False
 
-            # 提取媒体链接
-            image_list_raw = p.get("image_list", "") or ""
-            image_urls = [u.strip() for u in image_list_raw.split(",") if u.strip()]
-            video_url = p.get("video_url", "") or ""
+        except Exception as e:
+            logger.warning(f"   ⚠️ [LLM去重] 调用失败，使用规则兜底: {e}")
+            # 兜底：简单规则判断
+            return is_duplicate_event_simple(event_name, analyzed_names)
 
-            # 组装媒体上下文
-            media_context = ""
-            if image_urls:
-                media_context += f"【图片链接】{', '.join(image_urls)}\n"
-            if video_url:
-                media_context += f"【视频链接】{video_url}"
+    def is_duplicate_event_simple(event_name: str, analyzed_names: list) -> bool:
+        """简单规则兜底：字符串包含关系"""
+        if not analyzed_names:
+            return False
 
-            post_packet = {
-                "note_id": note_id,
-                "db_id": p.get("_id"),
-                "content": p.get("full_content") or p.get("content", ""),
-                "comments": comment_texts,
-                "comment_items": comment_items,
-                "media_context": media_context,
-                "audit_status": p.get("audit_status"),
-            }
-            valid_posts_data.append(post_packet)
+        event_name_clean = event_name.strip().replace("#", "")
 
-        # 2. 挂载数据 (基于原事件对象创建一个新字典)
-        current_event = dict(event)
-        current_event["_fetched_posts"] = valid_posts_data
+        for analyzed_name in analyzed_names:
+            analyzed_clean = analyzed_name.strip().replace("#", "")
 
-        # 3. Agent B 分析 (仅 Top M)
-        if i < ANALYZE_EVENT_COUNT and valid_posts_data:
-            logger.info(f"   🔍 [Node B] 深度分析: 《{event_name}》...")
+            # 完全相同
+            if event_name_clean == analyzed_clean:
+                return True
 
+            # 包含关系（且长度差不超过 5）
+            if event_name_clean in analyzed_clean or analyzed_clean in event_name_clean:
+                len_diff = abs(len(event_name_clean) - len(analyzed_clean))
+                if len_diff <= 5:
+                    return True
+
+        return False
+
+    # -------------------------------------------------------------------------
+    # Step 1: 并行抓取所有事件的数据
+    # -------------------------------------------------------------------------
+    logger.info(f"   📥 [Node B] 并行抓取 {len(target_events)} 个事件的数据...")
+
+    events_with_data = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_event = {
+            executor.submit(fetch_event_posts, evt): evt for evt in target_events
+        }
+
+        for future in concurrent.futures.as_completed(future_to_event):
+            evt = future_to_event[future]
+            try:
+                posts_data = future.result()
+                evt_copy = dict(evt)
+                evt_copy["_fetched_posts"] = posts_data
+                events_with_data.append(evt_copy)
+            except Exception as e:
+                logger.error(f"❌ [Node B] 抓取失败: {e}")
+                events_with_data.append(dict(evt))
+
+    # 按原始热度顺序排序
+    events_with_data.sort(key=lambda x: x.get("total_heat", 0), reverse=True)
+
+    # -------------------------------------------------------------------------
+    # Step 2: 🔥 串行深度分析 (使用 LLM 去重，确保分析 5 个不同事件)
+    # -------------------------------------------------------------------------
+    logger.info(
+        f"   🔍 [Node B] 开始深度分析 (必须 {ANALYZE_EVENT_COUNT} 个不同事件，使用 LLM 去重)..."
+    )
+
+    analyzed_results = []
+    analyzed_event_names = []  # 记录已分析的事件名，用于去重
+
+    for evt in events_with_data:
+        # 达到分析数量上限则停止
+        if len(analyzed_results) >= ANALYZE_EVENT_COUNT:
+            break
+
+        event_name = evt.get("event_name", "未知")
+        posts_data = evt.get("_fetched_posts", [])
+
+        # 检查是否有数据
+        if not posts_data:
+            logger.info(f"   ⏭️ [Node B] 跳过无数据事件: {event_name}")
+            continue
+
+        # 🔥 使用 LLM 检查是否与已分析事件重复
+        if is_duplicate_event_llm(event_name, analyzed_event_names):
+            continue
+
+        # 执行深度分析
+        logger.info(
+            f"   🔍 [Node B] 深度分析: 《{event_name}》 ({len(analyzed_results)+1}/{ANALYZE_EVENT_COUNT})..."
+        )
+
+        try:
             analysis_input = [
                 {
                     "content": d["content"],
                     "comments": d["comments"],
                     "media_context": d["media_context"],
                 }
-                for d in valid_posts_data
+                for d in posts_data
             ]
 
-            report = agent_opinions.analyze_event(event_name, analysis_input)
-            # 将报告也挂载到同一个对象上，保证数据不分裂
-            current_event["opinion_report"] = report
-            analyzed_results.append(current_event)
+            analyzed_res = agent_opinions.analyze_event(
+                event_name,
+                analysis_input,
+                start_date=start_date,
+                end_date=end_date,
+            )
 
-        processed_events.append(current_event)
+            if analyzed_res:
+                evt["opinion_report"] = analyzed_res
+                analyzed_results.append(evt)
+                analyzed_event_names.append(event_name)
+                logger.info(f"   ✅ [Node B] 完成分析: 《{event_name}》")
 
-    # 合并列表：[处理过的 Top 10] + [未处理的剩余事件]
-    final_core_events = processed_events + remaining_events
+        except Exception as e:
+            logger.error(f"❌ [Node B] 分析失败 ({event_name}): {e}")
+
+    # 合并剩余未处理的事件
+    final_list = events_with_data + all_events[FETCH_EVENT_COUNT:]
+
+    logger.info(
+        f"✅ [Node B] 完成。处理了 {len(events_with_data)} 个事件，深度分析 {len(analyzed_results)} 个。"
+    )
 
     return {
-        "analyzed_events": analyzed_results,  # 仅包含 Top 5 (带报告)
-        "core_events": final_core_events,  # 包含全量 (Top 10 带数据, Top 5 带报告)
+        "core_events": final_list,  # 更新带数据和报告的完整列表
+        "analyzed_events": analyzed_results,  # 只含被深度分析的
         "current_step": "B_Done",
     }
 
@@ -172,25 +336,18 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
 
     events_with_data = state.get("core_events", [])
     target_events = events_with_data[:10]
-    audit_results = []
-    post_audit_updates = []
-    comment_audit_updates = []
 
-    for event in target_events:
-        event_name = event.get("event_name", "未知")
-        posts = event.get("_fetched_posts", [])
-        if not posts:
-            continue
-
-        logger.info(f"   🔎 [Node C] 批量扫描: 《{event_name}》...")
-
-        for p in posts:
-            if p.get("audit_status") == "completed":
-                continue
+    # -------------------------------------------------------------------------
+    # 辅助函数：单个帖子的审核任务
+    # -------------------------------------------------------------------------
+    def process_single_audit_task(p, event_name):
+        try:
+            # 🔥 如果配置了强制重新审核，或者状态不是 completed，才进行审核
+            if not settings.FORCE_AUDIT_UPDATE and p.get("audit_status") == "completed":
+                return None
 
             # 这里的 comments 是全量 200 条（同时保留评论 _id 用于回写）
             comment_items = p.get("comment_items") or []
-            # 🔥 修正：移除 120 字符截断，确保 Agent C 看到完整内容
             comments_text_block = "\n".join(
                 [
                     f"{idx}. {(it.get('content','') or '')}"
@@ -210,7 +367,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
             matched_laws = rag_payload.get("matched_laws", [])
             evidence_report = rag_payload.get("evidence_report", {})
 
-            # 统一写回结构（全部塞进 violation_info，便于 Mongo 侧一次性落库）
+            # 统一写回结构
             violation_info = {
                 **(batch_res or {}),
                 "matched_laws": matched_laws,
@@ -222,37 +379,85 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                 or (batch_res.get("violated_comments") or [])
             )
 
-            # 1. 帖子粒度回写：无论是否违规，都标记为 completed
-            try:
-                post_audit_updates.append(
-                    {
-                        "id": p["db_id"],
-                        "is_violation": is_violation,
-                        "violation_info": violation_info,
-                    }
-                )
-            except Exception:
-                pass
+            # 返回结果包
+            return {
+                "post": p,
+                "event_name": event_name,
+                "is_violation": is_violation,
+                "violation_info": violation_info,
+                "comment_items": comment_items,
+                "violated_comments": batch_res.get("violated_comments") or [],
+            }
+        except Exception as e:
+            logger.error(f"❌ [Node C] 帖子审核失败 ({p.get('note_id')}): {e}")
+            return None
 
-            # 2. 评论粒度回写：🔥 修正逻辑，违规和不违规的都要更新状态
-            # 先构建一个 {index: violation_detail} 的映射表，方便快速查找
+    # -------------------------------------------------------------------------
+    # 1. 准备任务列表
+    # -------------------------------------------------------------------------
+    tasks = []
+    for event in target_events:
+        event_name = event.get("event_name", "未知")
+        posts = event.get("_fetched_posts", [])
+        if not posts:
+            continue
+
+        logger.info(
+            f"   🔎 [Node C] 准备批量扫描事件: 《{event_name}》({len(posts)} 贴)..."
+        )
+        for p in posts:
+            tasks.append((p, event_name))
+
+    # -------------------------------------------------------------------------
+    # 2. 并行执行 (ThreadPoolExecutor)
+    # -------------------------------------------------------------------------
+    audit_results = []
+    post_audit_updates = []
+    comment_audit_updates = []
+
+    # 同样控制并发数，Agent C 比较耗费 token 和计算，建议适中 (例如 5-8)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(process_single_audit_task, p, ename) for p, ename in tasks
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if not res:
+                continue
+
+            p = res["post"]
+            is_violation = res["is_violation"]
+            violation_info = res["violation_info"]
+            comment_items = res["comment_items"]
+            violated_comments = res["violated_comments"]
+
+            # --- 组装写回数据 ---
+
+            # A. 帖子回写
+            post_audit_updates.append(
+                {
+                    "id": p["db_id"],
+                    "is_violation": is_violation,
+                    "violation_info": violation_info,
+                }
+            )
+
+            # B. 评论回写
             violated_map = {}
-            raw_violated_list = batch_res.get("violated_comments") or []
-            for v_item in raw_violated_list:
+            for v_item in violated_comments:
                 try:
                     v_idx = int(v_item.get("index"))
                     violated_map[v_idx] = v_item
                 except:
                     continue
 
-            # 遍历该帖子下所有评论，逐一判断
             for idx, c_item in enumerate(comment_items):
                 c_db_id = c_item.get("db_id")
                 if not c_db_id:
                     continue
 
                 if idx in violated_map:
-                    # 命中违规
                     v_detail = violated_map[idx]
                     comment_audit_updates.append(
                         {
@@ -262,12 +467,11 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                                 "index": idx,
                                 "note_id": p.get("note_id"),
                                 "item": v_detail,
-                                "matched_laws": matched_laws,  # 附带上下文
+                                "matched_laws": violation_info.get("matched_laws"),
                             },
                         }
                     )
                 else:
-                    # 未命中 -> 标记为合规 (is_violation=False)
                     comment_audit_updates.append(
                         {
                             "id": c_db_id,
@@ -276,14 +480,36 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                         }
                     )
 
+            # C. 记录违规结果到 state
             if is_violation:
+                # 🔥 重构：保存原始帖子内容和违规评论原文，用于报告展示
+                violated_comment_texts = []
+                for v_item in violated_comments:
+                    try:
+                        v_idx = int(v_item.get("index", -1))
+                        if 0 <= v_idx < len(comment_items):
+                            original_text = comment_items[v_idx].get("content", "")
+                            violated_comment_texts.append(
+                                {
+                                    "index": v_idx,
+                                    "content": original_text,
+                                    "category": v_item.get("category", ""),
+                                    "risk_level": v_item.get("risk_level", ""),
+                                }
+                            )
+                    except:
+                        continue
+
                 audit_results.append(
                     {
-                        "event_name": event_name,
+                        "event_name": res["event_name"],
                         "note_id": p["note_id"],
                         "db_id": p["db_id"],
                         "is_violation": True,
                         "violation_info": violation_info,
+                        # 🔥 新增：保存原始内容
+                        "post_content": p.get("content", ""),  # 帖子原文
+                        "violated_comment_originals": violated_comment_texts,  # 违规评论原文
                     }
                 )
 
@@ -291,6 +517,9 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     if post_audit_updates:
         try:
             mongo_db.update_post_audit(post_audit_updates)
+            logger.info(
+                f"   ✅ [Node C] 已更新 {len(post_audit_updates)} 条帖子的审核状态。"
+            )
         except Exception as e:
             logger.error(f"   ⚠️ [Node C] 回写帖子审核结果失败: {e}")
 
@@ -298,6 +527,9 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     if comment_audit_updates:
         try:
             mongo_db.update_comment_audit(comment_audit_updates)
+            logger.info(
+                f"   ✅ [Node C] 已更新 {len(comment_audit_updates)} 条评论的审核状态。"
+            )
         except Exception as e:
             logger.error(f"   ⚠️ [Node C] 回写评论审核结果失败: {e}")
 
@@ -339,14 +571,30 @@ def agent_d_node(state: GraphState) -> Dict[str, Any]:
     audit_str = "\n".join(c_texts) if c_texts else "无高风险"
 
     # --- 🔥 新增：Node 层显式执行搜索逻辑 (符合架构设计) ---
-    # 1. 锁定时间坐标 (下个月)
+    # 0. 获取用户指定的预测范围 (从 state 读取)
+    forecast_range = state.get("forecast_range") or "1m"
+
+    # 解析预测范围，计算目标时间
+    range_map = {
+        "1w": (7, "days"),
+        "2w": (14, "days"),
+        "1m": (1, "months"),
+        "2m": (2, "months"),
+    }
+    delta_val, delta_unit = range_map.get(forecast_range, (1, "months"))
+
+    # 1. 锁定时间坐标
     now = datetime.now()
-    next_month_date = now + relativedelta(months=1)
-    target_year = next_month_date.year
-    target_month = next_month_date.month
+    if delta_unit == "days":
+        target_date = now + timedelta(days=delta_val)
+    else:
+        target_date = now + relativedelta(months=delta_val)
+
+    target_year = target_date.year
+    target_month = target_date.month
 
     logger.info(
-        f"   🌍 [Node D] 正在调取全网情报库 (目标: {target_year}年{target_month}月)..."
+        f"   🌍 [Node D] 正在调取全网情报库 (目标: {target_year}年{target_month}月, 范围: {forecast_range})..."
     )
 
     # 2. 搜历史铁律
@@ -364,12 +612,13 @@ def agent_d_node(state: GraphState) -> Dict[str, Any]:
     history_context = get_web_context(query_history)
     future_context = get_web_context(query_future)
 
-    # 4. 调用 Agent D 进行研判
+    # 4. 调用 Agent D 进行研判 (传递 forecast_range)
     forecast = agent_forecast.run(
         current_opinion_analysis=opinion_str,
         audit_risks=audit_str,
         history_context=history_context,
         future_context=future_context,
+        forecast_range=forecast_range,
     )
     return {"trend_forecast": forecast, "current_step": "D_Done"}
 

@@ -1,16 +1,18 @@
 import sqlite3
 from contextlib import contextmanager
 from langgraph.checkpoint.sqlite import SqliteSaver
+from app.core.config import settings
 
-# 定义 SQLite 文件路径 (直接放在项目根目录)
-DB_PATH = "checkpoints.sqlite"
+# 定义 SQLite 文件路径 (从配置读取)
+DB_PATH = settings.CHECKPOINT_DB_PATH
+
 
 class CheckpointerManager:
     """
     负责管理 LangGraph 的状态持久化 (Checkpointing)。
     实现“断点续传”和“会话记忆”的核心组件。
     """
-    
+
     @contextmanager
     def get_checkpointer(self):
         """
@@ -27,6 +29,7 @@ class CheckpointerManager:
             yield SqliteSaver(conn)
         finally:
             conn.close()
+
 
 # 单例导出
 checkpointer_manager = CheckpointerManager()

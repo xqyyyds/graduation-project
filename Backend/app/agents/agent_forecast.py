@@ -28,6 +28,8 @@ class AgentForecast:
             openai_api_key=settings.ZHIPU_API_KEY,
             openai_api_base=settings.LLM_BASE_URL,
             temperature=0.6,  # 保持灵活性，让思维链能发散
+            request_timeout=180,  # 🔥 增加超时时间
+            max_retries=3,
         )
         # 移除旧的 parser
         # self.parser = JsonOutputParser(pydantic_object=TrendForecastReport)
@@ -38,16 +40,36 @@ class AgentForecast:
         audit_risks: str,
         history_context: str = "",
         future_context: str = "",
+        forecast_range: str = "1m",
     ) -> Dict[str, Any]:
         logger.info("🔮 [Agent D] 启动全域时空研判系统 (Master CoT Mode)...")
 
-        # 1. 锁定时间坐标 (下个月)
+        # 1. 根据预测范围锁定时间坐标
         now = datetime.datetime.now()
-        next_month_date = now + relativedelta(months=1)
-        target_year = next_month_date.year
-        target_month = next_month_date.month
 
-        logger.info(f"📅 [Agent D] 研判目标: {target_year}年{target_month}月")
+        # 解析预测范围
+        range_map = {
+            "1w": ("一周", 7, "days"),
+            "2w": ("半个月", 14, "days"),
+            "1m": ("一个月", 1, "months"),
+            "2m": ("两个月", 2, "months"),
+        }
+        range_desc, delta_val, delta_unit = range_map.get(
+            forecast_range, ("一个月", 1, "months")
+        )
+
+        if delta_unit == "days":
+            target_date = now + datetime.timedelta(days=delta_val)
+        else:
+            target_date = now + relativedelta(months=delta_val)
+
+        target_year = target_date.year
+        target_month = target_date.month
+
+        # 构造目标时间描述
+        target_period = f"{now.strftime('%Y年%m月%d日')}起未来{range_desc}"
+
+        logger.info(f"📅 [Agent D] 研判目标: {target_period}")
 
         # 2. 构造 Prompt 链
         # 🔥 升级：使用 with_structured_output，不再需要 format_instructions
@@ -56,15 +78,14 @@ class AgentForecast:
 
         chain = prompt | structured_llm
 
-        # 修正：不再手动混合，而是直接传给 Prompt 中对应的插槽
-        # combined_current_analysis = ... (已移除)
-
         try:
             # 3. 执行推理
             report_obj = chain.invoke(
                 {
                     "target_year": target_year,
                     "target_month": target_month,
+                    "forecast_range": range_desc,
+                    "target_period": target_period,
                     "current_opinion_analysis": current_opinion_analysis,
                     "audit_risks": audit_risks,
                     "history_context": history_context,
@@ -84,6 +105,7 @@ class AgentForecast:
             # 🔥 将上下文挂载到返回结果中，供报告生成使用
             report["_context_history"] = history_context
             report["_context_future"] = future_context
+            report["_forecast_range"] = range_desc
 
             return report
 
@@ -91,7 +113,7 @@ class AgentForecast:
             logger.error(f"❌ [Agent D] 结构化解析失败: {e}")
             # 降级返回，保证流程不断 (适配新 Schema)
             return {
-                "target_month": f"{target_year}年{target_month}月",
+                "target_month": target_period,
                 "topics": [],  # 新 Schema 只有 topics
             }
 

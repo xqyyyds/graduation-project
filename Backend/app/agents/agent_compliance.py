@@ -19,7 +19,6 @@ from app.core.schemas import (
 )
 from app.core.prompts import (
     AGENT_C_ANALYSIS_TEMPLATE,
-    AGENT_C_REPORT_TEMPLATE,
     AGENT_C_BATCH_TEMPLATE,
     AGENT_C_EVIDENCE_TEMPLATE,
 )
@@ -36,6 +35,8 @@ class AgentCompliance:
             openai_api_key=settings.ZHIPU_API_KEY,
             openai_api_base=settings.LLM_BASE_URL,  # 这里的 URL 必须是智谱的地址
             temperature=0.1,
+            request_timeout=180,  # 🔥 增加超时时间
+            max_retries=3,
         )
         # 单条模式解析器 (Legacy)
         self.parser = JsonOutputParser(pydantic_object=AuditAnalysis)
@@ -301,73 +302,7 @@ class AgentCompliance:
             "evidence_report": evidence_report,
         }
 
-    # =======================================================
-    # 旧方法：单条审查 (保留用于兼容性或精细化 RAG)
-    # =======================================================
-    def _get_analysis_prompt(self):
-        return ChatPromptTemplate.from_template(AGENT_C_ANALYSIS_TEMPLATE).partial(
-            categories=", ".join(self.valid_categories),
-            format_instructions=self.parser.get_format_instructions(),
-        )
-
-    def audit_content(self, text: str) -> Dict[str, Any]:
-        """
-        (Legacy) 执行单条审查流程：Thinking -> Retrieval -> Verdict
-        """
-        logger.info(f"👮 [Agent C] 单条审查: “{text[:20]}...”")
-
-        # 1. 定性分析
-        analysis_chain = self._get_analysis_prompt() | self.llm | self.parser
-        try:
-            analysis: AuditAnalysis = analysis_chain.invoke({"user_input": text})
-        except Exception as e:
-            return {"error": str(e), "verdict": "Error"}
-
-        # 2. 快速通道：无违规
-        if not analysis["is_violation"] or analysis["category"] in ["无", "None"]:
-            return {
-                "verdict": "✅ 通过",
-                "analysis": dict(analysis),
-                "evidence": "无违规风险",
-            }
-
-        # 3. 精准检索 (Agentic RAG)
-        target_category = analysis["category"]
-        docs = chroma_db.search_related_laws(
-            query=target_category, top_k=1, category_filter=target_category
-        )
-
-        rule_content = "通用条款（未精准命中细则）"
-        article = "未知"
-
-        if docs:
-            rule_doc = docs[0]
-            if target_category in rule_doc.metadata.get("category", ""):
-                rule_content = rule_doc.page_content
-                article = rule_doc.metadata.get("article", "未知条款")
-
-        # 4. 生成判决书
-        final_report = self._generate_report(text, analysis, rule_content, article)
-
-        return {
-            "verdict": "❌ 违规",
-            "analysis": dict(analysis),
-            "evidence": {"article": article, "rule": rule_content},
-            "report": final_report,
-        }
-
-    def _generate_report(self, text, analysis, rule_content, article):
-        """生成自然语言判决书"""
-        chain = ChatPromptTemplate.from_template(AGENT_C_REPORT_TEMPLATE) | self.llm
-        return chain.invoke(
-            {
-                "text": text,
-                "category": analysis["category"],
-                "risk": analysis["risk_level"],
-                "article": article,
-                "rule_content": rule_content,
-            }
-        ).content
+    
 
 
 # 单例导出

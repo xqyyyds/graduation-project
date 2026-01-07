@@ -38,6 +38,8 @@ class AgentStats:
             related_keywords = event.get("related_keywords", [])
             formatted_events.append(
                 {
+                    # 显式处理 _id (如果有) -> 转 string
+                    "id": str(event.get("_id")) if event.get("_id") else None,
                     # 兼容字段（给报告/旧逻辑）
                     "topic": event_name,
                     "keywords": related_keywords,

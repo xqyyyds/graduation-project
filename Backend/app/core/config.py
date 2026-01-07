@@ -6,10 +6,13 @@ load_dotenv()
 
 class Settings:
     # llm设置
-    ZHIPU_API_KEY: str = os.getenv("ZHIPU_API_KEY", "")
-    LLM_MODEL = os.getenv("LLM_MODEL", "glm-4.6")
-    # 智谱 OpenAI-compat base url；允许用户通过 .env 覆盖
-    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+    # 🔥 全局切换为 ZetaTechs GPT-4o-mini
+    ZHIPU_API_KEY: str = os.getenv(
+        "ZHIPU_API_KEY", "sk-y170uJo6PLCyB4zCDRZGEJhZVeVDi4gaKYVBMtQDg0ve4zey"
+    )
+    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    # 智谱 OpenAI-compat base url -> 现在指向 ZetaTechs
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.zetatechs.com/v1")
 
     # embedding设置
     BAAI_API_KEY = os.getenv("BAAI_API_KEY", "")
@@ -25,8 +28,20 @@ class Settings:
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "media_crawler_db")
     CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 
+    # Checkpoint设置 (从 .env 读取，或指向项目根目录)
+    # 这里我们用一个基于 __file__ 的绝对路径做兜底，确保文件不会随便乱跑
+    _PROJECT_ROOT = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    CHECKPOINT_DB_PATH = os.getenv(
+        "CHECKPOINT_DB_PATH", os.path.join(_PROJECT_ROOT, "checkpoints.sqlite")
+    )
+
     # Tavily设置
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
+    # 🔥 调试开关：强制覆盖审核结果 (即使已审核过也重新审)
+    FORCE_AUDIT_UPDATE: bool = os.getenv("FORCE_AUDIT_UPDATE", "True").lower() == "true"
 
 
 settings = Settings()

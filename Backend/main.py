@@ -16,6 +16,7 @@ def run_task(
     start_date: str = None,
     end_date: str = None,
     regenerate_report: bool = False,
+    forecast_range: str = "1m",
 ):
     """
     执行舆情分析全流程
@@ -82,6 +83,7 @@ def run_task(
             "user_query": "启动全流程研判",
             "start_date": start_date,
             "end_date": end_date,
+            "forecast_range": forecast_range,  # 预测时间范围
             # 初始化空列表，防止首次运行报错
             "messages": [],
             "core_events": [],
@@ -171,6 +173,13 @@ if __name__ == "__main__":
         action="store_true",
         help="【断点陨星】仅重新生成报告（需配合 --id 使用），跳过前面所有步骤，直接读取缓存。",
     )
+    parser.add_argument(
+        "--forecast",
+        type=str,
+        choices=["1w", "2w", "1m", "2m"],
+        default="1m",
+        help="趋势预测时间范围：1w=一周, 2w=半个月, 1m=一个月, 2m=两个月 (默认1m)",
+    )
 
     args = parser.parse_args()
 
@@ -204,4 +213,5 @@ if __name__ == "__main__":
         start_date=s_date,
         end_date=e_date,
         regenerate_report=args.regenerate_report,
+        forecast_range=args.forecast,
     )

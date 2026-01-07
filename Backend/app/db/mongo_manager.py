@@ -178,12 +178,24 @@ class MongoManager:
 
         query = {"source_keyword": {"$in": keywords}}
         # 按点赞数倒序，取最热的帖子
-        return list(
-            self.db["weibo_contents"]
-            .find(query)
-            .sort("liked_count", DESCENDING)
-            .limit(limit)
-        )
+        # 🔥 修正：使用 collation 做数值排序，解决字符串 "10" < "2" 的问题
+        try:
+            return list(
+                self.db["weibo_contents"]
+                .find(query)
+                .sort("liked_count", DESCENDING)
+                .collation({"locale": "en_US", "numericOrdering": True})
+                .limit(limit)
+            )
+        except Exception as e:
+            # 万一 DB 版本过低不支持 collation，降级为普通查询
+            logger.warning(f"⚠️ [MongoDB] Collation 排序失败，降级为普通排序: {e}")
+            return list(
+                self.db["weibo_contents"]
+                .find(query)
+                .sort("liked_count", DESCENDING)
+                .limit(limit)
+            )
 
     def get_comments_by_post_ids(
         self, note_ids: List[str], limit: int = 200
@@ -199,12 +211,23 @@ class MongoManager:
         query = {"note_id": {"$in": note_ids}}
 
         # 这里加上 sort，确保 Agent B 分析的是热门观点
-        return list(
-            self.db["weibo_comments"]
-            .find(query)
-            .sort("comment_like_count", DESCENDING)
-            .limit(limit)
-        )
+        # 🔥 修正：使用 collation 做数值排序
+        try:
+            return list(
+                self.db["weibo_comments"]
+                .find(query)
+                .sort("comment_like_count", DESCENDING)
+                .collation({"locale": "en_US", "numericOrdering": True})
+                .limit(limit)
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ [MongoDB] Collation 排序失败，降级为普通排序: {e}")
+            return list(
+                self.db["weibo_comments"]
+                .find(query)
+                .sort("comment_like_count", DESCENDING)
+                .limit(limit)
+            )
 
     def get_pending_posts(self, batch_size: int = 50) -> List[Dict]:
         """

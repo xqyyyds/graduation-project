@@ -1,5 +1,5 @@
-import json
 from typing import List, Dict, Any
+import concurrent.futures
 
 # LangChain 组件
 from langchain_openai import ChatOpenAI
@@ -32,6 +32,8 @@ class AgentOpinions:
             openai_api_key=settings.ZHIPU_API_KEY,
             openai_api_base=settings.LLM_BASE_URL,
             temperature=0.3,  # 稍微增加一点随机性以获取丰富观点
+            request_timeout=180,  # 🔥 增加超时时间
+            max_retries=3,
         )
 
         # 初始化结构化解析器 (已弃用，改用 with_structured_output)
@@ -46,7 +48,13 @@ class AgentOpinions:
             self.search_tool = None
             logger.warning("⚠️ [Agent B] Tavily 搜索工具初始化失败，将跳过联网搜索。")
 
-    def analyze_event(self, event_name: str, posts_data: List[Dict]) -> Dict[str, Any]:
+    def analyze_event(
+        self,
+        event_name: str,
+        posts_data: List[Dict],
+        start_date: str = "",
+        end_date: str = "",
+    ) -> Dict[str, Any]:
         """
         全流程执行入口
         :param event_name: 事件名称
@@ -54,17 +62,33 @@ class AgentOpinions:
         """
         logger.info(f"🧐 [Agent B] 启动高精度舆情分析: “{event_name}”")
 
+        start_date = (start_date or "").strip()
+        end_date = (end_date or "").strip()
+        if start_date and end_date:
+            report_period = f"{start_date} 至 {end_date}"
+            period_hint = f"{start_date[:10]}~{end_date[:10]}"
+        elif start_date or end_date:
+            report_period = (
+                f"{start_date or '开始时间未知'} 至 {end_date or '结束时间未知'}"
+            )
+            period_hint = (
+                start_date[:10] if start_date else (end_date[:10] if end_date else "")
+            )
+        else:
+            report_period = "本期"
+            period_hint = ""
+
         # --- Step 1: Search (联网获取背景事实) ---
         web_context = "暂无网络背景信息"
         if self.search_tool:
             logger.info(f"      🌐 [Search] 正在检索背景信息...")
             try:
                 # 构造搜索词，确保获取官方口径
-                search_query = f"{event_name} 事件详情 官方通报"
+                search_query = f"{event_name} {period_hint} 事件详情 官方通报".strip()
                 search_res = self.search_tool.invoke(search_query)
                 web_context = str(search_res)
             except Exception as e:
-                logger.error(f"      ❌ 搜索失败: {e}")
+                logger.warning(f"⚠️ [Agent B] 联网检索失败，将使用空背景: {e}")
 
         # --- Step 2: Map (分批处理热门贴) ---
         logger.info(f"📊 [Agent B] 正在扫描 {len(posts_data)} 个舆论战场(热门贴)...")
@@ -72,22 +96,59 @@ class AgentOpinions:
         # 🔥 升级：使用 with_structured_output 替代 JsonOutputParser
         # 这样更稳定，且不需要在 Prompt 里塞 format_instructions
         structured_llm = self.llm.with_structured_output(PostOpinionSummary)
-
         map_prompt = ChatPromptTemplate.from_template(AGENT_B_MAP_TEMPLATE)
         map_chain = map_prompt | structured_llm
 
-        map_results = []
+        def _select_comment_excerpts(raw_comments: Any, limit: int = 8) -> List[str]:
+            if not raw_comments:
+                return []
+            if not isinstance(raw_comments, list):
+                return [str(raw_comments)[:120]]
 
-        for i, post in enumerate(posts_data):
-            try:
-                # 调用 Map 逻辑
-                summary = self._map_single_post(post, map_chain)
-                map_results.append(summary)
-            except Exception as e:
-                logger.warning(f"      ⚠️ 帖子 {i+1} Map分析跳过: {e}")
-                continue
+            excerpts: List[str] = []
+            seen = set()
+            for c in raw_comments:
+                t = (c or "").strip()
+                if len(t) < 8:
+                    continue
+                if t in seen:
+                    continue
+                seen.add(t)
+                excerpts.append(t[:120])
+                if len(excerpts) >= limit:
+                    break
+            return excerpts
 
-        if not map_results:
+        map_payloads: List[Dict[str, Any]] = []
+
+        # 🔥 升级：并行处理 (ThreadPool) 加速 Map 阶段
+        # 建议根据 API Rate Limit 调整 max_workers (例如 5-10)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            # 提交所有任务
+            future_to_index = {
+                executor.submit(self._map_single_post, post, map_chain): (i, post)
+                for i, post in enumerate(posts_data)
+            }
+
+            for future in concurrent.futures.as_completed(future_to_index):
+                i, post = future_to_index[future]
+                try:
+                    summary = future.result()
+                    map_payloads.append(
+                        {
+                            "index": i,
+                            "summary": summary,
+                            "comment_excerpts": _select_comment_excerpts(
+                                post.get("comments", []), limit=8
+                            ),
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"      ⚠️ 帖子 {i+1} Map分析跳过: {e}")
+
+        map_payloads.sort(key=lambda x: x.get("index", 0))
+
+        if not map_payloads:
             return {
                 "event_overview": "有效观点过少，无法生成报告",
                 "public_opinions": [],
@@ -97,7 +158,12 @@ class AgentOpinions:
         # --- Step 3: Reduce (深度聚合) ---
         logger.info(f"🧩 [Agent B] 正在聚合多维观点，生成深度报告 (Reduce)...")
         try:
-            final_report = self._reduce_summaries(event_name, web_context, map_results)
+            final_report = self._reduce_summaries(
+                event_name=event_name,
+                report_period=report_period,
+                web_context=web_context,
+                map_payloads=map_payloads,
+            )
             logger.info(f"✅ [Agent B] 事件 “{event_name}” 分析完成。")
 
             # 返回字典供 State 存储
@@ -146,7 +212,11 @@ class AgentOpinions:
         )
 
     def _reduce_summaries(
-        self, event_name: str, web_context: str, map_results: List[PostOpinionSummary]
+        self,
+        event_name: str,
+        report_period: str,
+        web_context: str,
+        map_payloads: List[Dict[str, Any]],
     ) -> EventAnalysisReport:
         """
         Reduce 逻辑：将碎片化的【观点簇】缝合成一份有层次感的报告
@@ -154,7 +224,9 @@ class AgentOpinions:
         # 格式化 Map 结果
         mapped_text_list = []
 
-        for i, res in enumerate(map_results):
+        for i, payload in enumerate(map_payloads):
+            res = (payload or {}).get("summary")
+            comment_excerpts = (payload or {}).get("comment_excerpts") or []
             # 兼容性处理：防止 res 是 dict 而不是对象
             if isinstance(res, dict):
                 # 如果是 dict，尝试转成 Pydantic 对象，或者直接读 key
@@ -181,10 +253,18 @@ class AgentOpinions:
 
             cluster_text = "; ".join(clusters_desc)
 
+            # 预处理评论摘录（f-string 中不能包含反斜杠）
+            excerpts_lines = []
+            for t in comment_excerpts[:8]:
+                cleaned = str(t).replace("\n", " ")[:120]
+                excerpts_lines.append(f"\n   - {cleaned}")
+            excerpts_text = "".join(excerpts_lines)
+
             entry = (
                 f"【帖子{i+1} 分析切片】\n"
                 f"   - 冲突分析: {conflict}\n"
-                f"   - 观点分布: {cluster_text}"
+                f"   - 观点分布: {cluster_text}\n"
+                f"   - 评论样本摘录:{excerpts_text if excerpts_text else '（无）'}"
             )
             mapped_text_list.append(entry)
 
@@ -200,6 +280,7 @@ class AgentOpinions:
         return chain.invoke(
             {
                 "event_name": event_name,  # 注意 Prompt 里如果用了这个变量就要传
+                "report_period": report_period,
                 "web_search_context": web_context,
                 "mapped_summaries": mapped_summaries,
             }
