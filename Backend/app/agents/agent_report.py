@@ -83,7 +83,22 @@ class AgentReport:
             f"【重点深读摘要Top8】\n{deep_read_str}"
         )
 
-        violations = [r for r in audit_results if r.get("is_violation")]
+        # 当 LLM 未标记为违规但 RAG 命中条款（matched_laws）时，也应当纳入报告展示。
+        violations = []
+        for r in audit_results:
+            info = r.get("violation_info") or {}
+            evidence = info.get("evidence_report") or {}
+            # 判断为需展示的违规项的条件：
+            # 1) 明确标记为违规（is_violation）
+            # 2) 或者 RAG 命中条款（matched_laws 非空）
+            # 3) 或者 LLM 生成了证据推理(reasoining) or disposal_suggestion
+            if (
+                r.get("is_violation")
+                or (info.get("matched_laws") or [])
+                or evidence.get("reasoning")
+                or evidence.get("disposal_suggestion")
+            ):
+                violations.append(r)
 
         # 🔥 升级：生成更丰富的合规摘要，供 Agent E 写前言
         if not violations:
@@ -138,12 +153,13 @@ class AgentReport:
             pass
 
         # 3. 组装 Markdown (传入 core_events 用于表格)
+        category = state_data.get("category", "综合")
         md_content = self._assemble_markdown(
-            preface, core_events, analyzed_events, violations, trend_report
+            preface, core_events, analyzed_events, violations, trend_report, category
         )
 
         # 4. 保存 Markdown 文件 (不再生成 PDF，建议用 Typora 等工具打开 .md 导出)
-        md_filename = f"舆情研判_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+        md_filename = f"舆情研判_{category}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
         md_path = self._save_markdown(md_content, md_filename)
 
         return {"markdown": md_content, "md_path": md_path}
@@ -193,24 +209,72 @@ class AgentReport:
         b_events: List,
         c_violations: List,
         d_trend: Dict,
+        category: str = "综合",
     ) -> str:
         """
         拼装最终报告 (Markdown 格式)
         """
         date_str = datetime.now().strftime("%Y年%m月%d日")
 
+        def _normalize_body_text(s: Any) -> str:
+            """归一化 LLM 输出，避免字面量 \\n 导致 Markdown 分段失效。"""
+            if s is None:
+                return ""
+            text = str(s)
+            # 统一真实换行
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            # 将字面量 "\\n" 还原成真实换行
+            text = text.replace("\\n", "\n")
+            # 清理制表符，避免渲染器异常（正文中用空格即可）
+            text = text.replace("\t", "    ")
+            # 过滤其余 ASCII 控制字符（保留换行）
+            text = "".join(
+                ch for ch in text if (ch == "\n" or (ch >= " " and ch != "\x7f"))
+            )
+            # 🔥 二次去emoji（保险起见）
+            # (这里可以加正则去 emoji，暂时先不加以免引入额外依赖，依靠 Prompt 约束)
+            return text.strip()
+
+        # ==============================================================================
+        # 内嵌样式（使 Markdown 在各种渲染器中都有良好的表格显示效果）
+        # ==============================================================================
+        css_style = """<style>
+/* 内容安全审核报告样式 */
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.8; color: #333; max-width: 1200px; margin: 0 auto; padding: 32px; }
+h1 { font-size: 26px; font-weight: 700; color: #1a1a1a; text-align: center; margin: 24px 0; padding-bottom: 16px; border-bottom: 2px solid #2563eb; }
+h2 { font-size: 20px; font-weight: 600; color: #1a1a1a; margin: 40px 0 20px; padding: 10px 14px; background: #f0f7ff; border-left: 4px solid #2563eb; border-radius: 0 6px 6px 0; }
+h3 { font-size: 17px; font-weight: 600; color: #333; margin: 32px 0 16px; padding-bottom: 8px; border-bottom: 1px solid #e5e7eb; }
+h4 { font-size: 16px; font-weight: 600; color: #1f2937; margin: 28px 0 14px; }
+blockquote { background: #fafafa; border-left: 3px solid #ddd; padding: 14px 20px; margin: 16px 0; border-radius: 0 6px 6px 0; color: #555; }
+hr { border: none; border-top: 1px solid #e0e0e0; margin: 32px 0; }
+/* 表格 */
+table { width: 100%; border-collapse: collapse; margin: 16px 0 28px; font-size: 13px; border: 1px solid #d1d5db; }
+thead { background: #475569; }
+th { padding: 10px 12px; text-align: left; font-weight: 600; font-size: 13px; color: #fff; border: 1px solid #475569; white-space: nowrap; }
+tbody tr:nth-child(odd) { background: #fff; }
+tbody tr:nth-child(even) { background: #f8fafc; }
+td { padding: 10px 12px; text-align: left; color: #374151; vertical-align: top; line-height: 1.5; border: 1px solid #e5e7eb; }
+strong { color: #1a1a1a; }
+em { color: #666; }
+@media print { body { padding: 16px; font-size: 12px; } table { page-break-inside: avoid; font-size: 11px; } th, td { padding: 6px 8px; } }
+</style>
+
+"""
+
         # ==============================================================================
         # 1. 封面与前言 (Cover & Preface)
         # ==============================================================================
-        md = f"# 内容安全审核与分析报告\n\n"
+        title_suffix = f"（{category}）" if category and category != "综合" else ""
+        md = css_style
+        md += f"# 内容安全审核与分析报告{title_suffix}\n\n"
         md += f"**报告日期**：{date_str}\n\n"
         md += f"**研判周期**：{p.report_period}\n\n"
         md += "---\n\n"
 
-        md += "## 💡 前言：舆情态势综述\n\n"
+        md += "## 前言：舆情态势综述\n\n"
 
         # (1) 开篇综述
-        md += f"{p.overview}\n\n"
+        md += f"{_normalize_body_text(p.overview)}\n\n"
 
         # (2) 核心特征 (段落渲染)
         md += "**总体来看，当下舆情生态呈现以下核心特征：**\n\n"
@@ -224,24 +288,24 @@ class AgentReport:
         md += "\n"
 
         # (3) 违规透视
-        md += f"**【违规风险透视】**\n\n{p.compliance_perspective}\n\n"
+        md += f"**【违规风险透视】**\n\n{_normalize_body_text(p.compliance_perspective)}\n\n"
 
         # (4) 时空承接
-        md += f"**【时空趋势承接】**\n\n{p.trend_connection}\n\n"
+        md += f"**【时空趋势承接】**\n\n{_normalize_body_text(p.trend_connection)}\n\n"
 
         # (5) 结语
-        md += f"**{p.conclusion}**\n\n"
+        md += f"**{_normalize_body_text(p.conclusion)}**\n\n"
 
         md += "<div style='page-break-after: always;'></div>\n\n"  # 强制分页
 
         # ==============================================================================
         # 2. 本期热点舆情总览 (Overview Table)
         # ==============================================================================
-        md += "## 📊 第一部分：本期热点舆情总览\n\n"
+        md += "## 第一部分：本期热点舆情总览\n\n"
         md += f"基于全网大数据监测，本期（{p.report_period}）核心热点事件汇总如下：\n\n"
 
-        md += "| 序号 | 📅 时间 | 🔥 事件名称 | 🏷️ 核心标签 | 🌡️ 热度值 |\n"
-        md += "| :---: | :--- | :--- | :---: | :---: |\n"
+        md += "| 序号 | 时间 | 事件名称 | 热度值 |\n"
+        md += "| :---: | :---: | :--- | :---: |\n"
 
         # 🔥 辅助函数：清理 # 号
         def _clean_hashtag(s: str) -> str:
@@ -251,7 +315,7 @@ class AgentReport:
             return s.strip().strip("#").strip()
 
         if not core_events:
-            md += "| - | - | 暂无数据 | - | - |\n"
+            md += "| - | - | 暂无数据 | - |\n"
         else:
             # 🔥 去重：按 event_name 去重，保留首次出现的（热度最高的）
             seen_names = set()
@@ -267,34 +331,26 @@ class AgentReport:
             # 取前 20 条展示（若不足 20 条则展示全部）
             for i, evt in enumerate(unique_events[:20]):
                 raw_time = str(evt.get("created_at", ""))[:10]
-                related_keywords = (
-                    evt.get("related_keywords") or evt.get("keywords") or []
-                )
-                # 🔥 清理核心标签的 # 号
-                category = (
-                    _clean_hashtag(related_keywords[0]) if related_keywords else "综合"
-                )
                 heat_val = evt.get("total_heat", 0)
                 heat_str = (
                     f"{heat_val/10000:.1f}万" if heat_val > 10000 else str(heat_val)
                 )
-                # 🔥 清理事件名称的 # 号
+                # 🔥 直接使用热搜标题，清理 # 号
                 event_title = _clean_hashtag(
                     evt.get("event_name") or evt.get("topic") or "未知"
                 )
 
                 # 表格内容转义，防止 Markdown 错乱
                 event_title = event_title.replace("|", r"\|")
-                category = category.replace("|", r"\|")
 
-                md += f"| {i+1} | {raw_time} | {event_title} | {category} | {heat_str} |\n"
+                md += f"| {i+1} | {raw_time} | {event_title} | {heat_str} |\n"
 
-        md += "\n<div style='page-break-after: always;'></div>\n\n"
+        md += "<div style='page-break-after: always;'></div>\n\n"
 
         # ==============================================================================
         # 3. 重点舆情深读 (Deep Analysis)
         # ==============================================================================
-        md += "## 🔥 第二部分：重点舆情深读\n\n"
+        md += "## 第二部分：重点舆情深读\n\n"
         if not b_events:
             md += "（本期无重点事件）\n"
 
@@ -309,27 +365,30 @@ class AgentReport:
 
         for i, e in enumerate(unique_b_events):
             r = e.get("opinion_report", {})
-            event_title = e.get("event_name") or e.get("topic") or "未知"
+            # 🔥 优先使用原始热搜标题 raw_title，否则使用 event_name
+            event_title = _clean_hashtag(
+                e.get("raw_title") or e.get("event_name") or e.get("topic") or "未知"
+            )
 
             md += f"### {i+1}. 事件：《{event_title}》\n\n"
 
-            # (1) 事件概况 (引用块)
-            md += f"> **事件概况**\n>\n> {r.get('event_overview', '暂无概况')}\n\n"
+            # (1) 事件概况 - 🔥 改为 h4 + 段落，与其他部分样式一致
+            md += f"#### 事件概况\n\n"
+            md += f"{_normalize_body_text(r.get('event_overview', '暂无概况'))}\n\n"
 
-            # (2) 舆论观点画像 (段落/引用块渲染)
-            md += f"#### 🗣️ 舆论观点画像\n\n"
+            # (2) 舆论观点画像
+            md += f"#### 舆论观点画像\n\n"
             ops = r.get("public_opinions", [])
             if isinstance(ops, list):
                 for op in ops:
-                    # 🔥 改为引用块或段落，增加叙事感
-                    md += f"> {op}\n>\n"
+                    md += f"- {_normalize_body_text(op)}\n"
             else:
-                md += f"> {ops}\n"
+                md += f"{_normalize_body_text(ops)}\n"
             md += "\n"
 
-            # (3) 深度研判 (正文)
-            md += f"#### 🧠 深度研判\n\n"
-            md += f"{r.get('depth_analysis', '暂无分析')}\n\n"
+            # (3) 深度研判
+            md += f"#### 深度研判\n\n"
+            md += f"{_normalize_body_text(r.get('depth_analysis', '暂无分析'))}\n\n"
 
             md += "---\n\n"
 
@@ -338,7 +397,7 @@ class AgentReport:
         # ==============================================================================
         # 4. 未来趋势与战略预警 (Forecast)
         # ==============================================================================
-        md += "## 🔮 第三部分：未来趋势与战略预警\n\n"
+        md += "## 第三部分：未来趋势与战略预警\n\n"
 
         # 适配新版 Schema (TrendForecastReport: target_month, topics)
         topics = d_trend.get("topics", [])
@@ -353,7 +412,7 @@ class AgentReport:
                 # 背景
                 bg = topic.get("background")
                 if bg:
-                    md += f"> **背景导语**：{bg}\n\n"
+                    md += f"> **背景导语**：{_normalize_body_text(bg)}\n\n"
 
                 # 风险点
                 points = topic.get("points", [])
@@ -362,7 +421,7 @@ class AgentReport:
                     content = point.get("content", "")
                     # 移除可能重复的编号
                     md += f"#### {sub}\n"
-                    md += f"{content}\n\n"
+                    md += f"{_normalize_body_text(content)}\n\n"
         else:
             md += "（暂无预测数据）\n"
 
@@ -371,19 +430,35 @@ class AgentReport:
         # ==============================================================================
         # 5. 附录：违规数据监测 (Appendix)
         # ==============================================================================
-        md += "## 🛡️ 附录：违规数据监测\n\n"
+        md += "## 附录：违规数据监测\n\n"
         if not c_violations:
             md += "本期未检出需要处置的违规内容。\n"
             return md
 
         def _esc_cell(s: Any) -> str:
-            return (
-                str(s)
-                .replace("|", r"\|")
-                .replace("\r\n", "<br>")
-                .replace("\n", "<br>")
-                .strip()
-            )
+            if s is None:
+                return ""
+
+            # Markdown 表格单元格净化：
+            # - 转义竖线，避免意外拆列
+            # - 将所有换行统一为 <br>，避免意外断行
+            # - 移除/替换控制字符（尤其是 \r、\t），避免渲染器异常
+            text = str(s)
+
+            # 先统一换行
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text = text.replace("\n", "<br>")
+
+            # 制表符会导致“看起来像 TSV/表格行”并影响渲染
+            text = text.replace("\t", " ")
+
+            # 转义 Markdown 表格分隔符
+            text = text.replace("|", r"\|")
+
+            # 过滤其余 ASCII 控制字符（保留常用空格）
+            text = "".join(ch for ch in text if (ch >= " " and ch != "\x7f"))
+
+            return text.strip()
 
         total_posts = len(c_violations)
         total_violated_comments = 0
@@ -427,20 +502,12 @@ class AgentReport:
                     cat = (it or {}).get("category") or "其他"
                     category_counts[cat] = category_counts.get(cat, 0) + 1
 
-            # 条款引用统计：优先 evidence_report.cited_laws（核心依据），否则退化到 matched_laws
-            cited_laws = (info.get("evidence_report") or {}).get("cited_laws") or []
-            if isinstance(cited_laws, list) and cited_laws:
-                for law in cited_laws:
-                    cat = (law or {}).get("category") or "未知标签"
-                    article = (law or {}).get("article") or "未知条款"
-                    key = f"{cat} / {article}"
-                    law_counts[key] = law_counts.get(key, 0) + 1
-            else:
-                for law in info.get("matched_laws") or []:
-                    cat = (law or {}).get("category") or "未知标签"
-                    article = (law or {}).get("article") or "未知条款"
-                    key = f"{cat} / {article}"
-                    law_counts[key] = law_counts.get(key, 0) + 1
+            # 条款引用统计：强制使用检索到的数据库 metadata (matched_laws)，不使用 LLM 生成的 evidence_report.cited_laws
+            for law in info.get("matched_laws") or []:
+                cat = (law or {}).get("category") or "未知标签"
+                article = (law or {}).get("article") or "未知条款"
+                key = f"{cat} / {article}"
+                law_counts[key] = law_counts.get(key, 0) + 1
 
             suggestion = (info.get("evidence_report") or {}).get("disposal_suggestion")
             if suggestion:
@@ -540,7 +607,6 @@ class AgentReport:
             md += "（本期未生成可统计的条款引用数据）\n\n"
 
         # (5) 案例明细（按事件分组展示）
-        # 🔥 重构：7 列表格，包含证据链
         md += "### 5) 案例明细（按事件分组）\n\n"
 
         # 按事件分组
@@ -551,16 +617,17 @@ class AgentReport:
                 events_violations[ename] = []
             events_violations[ename].append(v)
 
+        event_num = 0  # 事件序号
+        case_num = 0  # 全局案例序号
         for event_name, violations in events_violations.items():
-            md += f"#### 📌 {_esc_cell(event_name)}\n\n"
-            # 🔥 7 列表格：note_id | 风险 | 违规原文 | 判定理由 | 核心条款 | 建议 | 证据链
-            md += (
-                "| note_id | 风险 | 违规原文 | 判定理由 | 核心条款 | 建议 | 证据链 |\n"
-            )
-            md += "| :--- | :---: | :--- | :--- | :--- | :--- | :--- |\n"
+            event_num += 1
+            md += f"#### {event_num}. {_esc_cell(event_name)}\n\n"
+            # 6列表格：序号 | 风险 | 违规内容 | 判定理由 | 违反条款 | 处置建议
+            md += "| 序号 | 风险 | 违规内容 | 判定理由 | 违反条款 | 处置建议 |\n"
+            md += "| :---: | :---: | :--- | :--- | :--- | :--- |\n"
 
             for v in violations:
-                note_id = v.get("note_id") or ""
+                case_num += 1
                 info = v.get("violation_info") or {}
                 if info is None:
                     continue
@@ -573,170 +640,63 @@ class AgentReport:
 
                 evidence_report = info.get("evidence_report") or {}
 
-                # ========================================
-                # 🔥 违规原文：优先使用保存的原始内容
-                # ========================================
+                # 违规内容
                 violation_text_parts = []
-
-                # 1. 帖子原文（如果帖子本身违规）
                 post_content = v.get("post_content", "")
                 is_post_violated = info.get("is_post_violated", False)
                 if is_post_violated and post_content:
-                    post_excerpt = post_content[:80].strip()
-                    if len(post_content) > 80:
-                        post_excerpt += "..."
-                    violation_text_parts.append(f"【帖】{_esc_cell(post_excerpt)}")
+                    truncated = post_content.strip()[:60]
+                    if len(post_content.strip()) > 60:
+                        truncated += "..."
+                    violation_text_parts.append(f"【帖】{_esc_cell(truncated)}")
 
-                # 2. 违规评论原文
                 violated_comment_originals = v.get("violated_comment_originals", [])
+                seen_comments = set()
                 if violated_comment_originals:
-                    for vc in violated_comment_originals[:2]:
-                        content = vc.get("content", "")
-                        if content:
-                            comment_excerpt = content[:60].strip()
-                            if len(content) > 60:
-                                comment_excerpt += "..."
-                            violation_text_parts.append(
-                                f"【评】{_esc_cell(comment_excerpt)}"
-                            )
-
-                # 如果没有原始内容，退化到 evidence_chain
-                if not violation_text_parts:
-                    chain = evidence_report.get("evidence_chain")
-                    if chain:
-                        if isinstance(chain, list):
-                            for item in chain[:2]:
-                                violation_text_parts.append(_esc_cell(str(item)[:60]))
-                        elif isinstance(chain, str):
-                            violation_text_parts.append(_esc_cell(chain[:80]))
+                    for vc in violated_comment_originals:
+                        content = (vc.get("content") or "").strip()
+                        # 保留所有去重后的评论（取消任何后端长度限制），前端负责展示与截断
+                        if content and content not in seen_comments:
+                            seen_comments.add(content)
+                            violation_text_parts.append(f"【评】{_esc_cell(content)}")
 
                 violation_cell = (
-                    "<br>".join(violation_text_parts)
-                    if violation_text_parts
-                    else "（无）"
+                    "<br>".join(violation_text_parts) if violation_text_parts else "-"
                 )
 
-                # ========================================
                 # 判定理由
-                # ========================================
                 evidence_reasoning = evidence_report.get("reasoning")
                 if evidence_reasoning:
-                    # 截取前 80 字
-                    reasoning_excerpt = evidence_reasoning[:80].strip()
-                    if len(evidence_reasoning) > 80:
-                        reasoning_excerpt += "..."
-                    reasoning_cell = _esc_cell(reasoning_excerpt)
+                    reasoning_cell = evidence_reasoning.strip()[:80]
+                    if len(evidence_reasoning.strip()) > 80:
+                        reasoning_cell += "..."
+                    reasoning_cell = _esc_cell(reasoning_cell)
                 else:
-                    reasoning_cell = "（无）"
+                    reasoning_cell = "-"
 
-                # ========================================
-                # 🔥 核心条款：加入法规原文
-                # ========================================
-                cited = evidence_report.get("cited_laws") or []
-                law_cell_parts = []
+                # 违反条款：使用 matched_laws 的 metadata，格式：《《微博社区公约》》+article：+ category+behavior
+                law_parts = []
+                for law in info.get("matched_laws") or []:
+                    if not law:
+                        continue
+                    art = law.get("article", "")
+                    cat = law.get("category", "")
+                    behavior = law.get("full_desc", "")
+                    text = f"《《微博社区公约》》{art}：{cat}\n{behavior}".strip()
+                    law_parts.append(text)
+                law_cell = _esc_cell("、".join(law_parts)) if law_parts else "-"
 
-                if isinstance(cited, list) and cited:
-                    for law in cited[:2]:
-                        if not law:
-                            continue
-                        cat = law.get("category", "")
-                        art = law.get("article", "")
-                        rule_text = (
-                            law.get("rule", "")
-                            or law.get("content", "")
-                            or law.get("text", "")
-                        )
-
-                        if cat and art:
-                            law_header = f"**{_esc_cell(cat)} {_esc_cell(art)}**"
-                        elif cat:
-                            law_header = f"**{_esc_cell(cat)}**"
-                        elif art:
-                            law_header = f"**{_esc_cell(art)}**"
-                        else:
-                            law_header = ""
-
-                        if rule_text:
-                            rule_excerpt = rule_text[:50].strip()
-                            if len(rule_text) > 50:
-                                rule_excerpt += "..."
-                            if law_header:
-                                law_cell_parts.append(
-                                    f"{law_header}: {_esc_cell(rule_excerpt)}"
-                                )
-                            else:
-                                law_cell_parts.append(_esc_cell(rule_excerpt))
-                        elif law_header:
-                            law_cell_parts.append(law_header)
-
-                # 如果 cited_laws 为空，尝试从 matched_laws 获取
-                if not law_cell_parts:
-                    ml = info.get("matched_laws") or []
-                    for law in ml[:2]:
-                        if not law:
-                            continue
-                        cat = law.get("category", "")
-                        art = law.get("article", "")
-                        rule_text = (
-                            law.get("rule", "")
-                            or law.get("content", "")
-                            or law.get("text", "")
-                        )
-
-                        if cat or art:
-                            law_header = (
-                                f"**{_esc_cell(cat)} {_esc_cell(art)}**".strip()
-                            )
-                            if rule_text:
-                                rule_excerpt = rule_text[:50].strip()
-                                if len(rule_text) > 50:
-                                    rule_excerpt += "..."
-                                law_cell_parts.append(
-                                    f"{law_header}: {_esc_cell(rule_excerpt)}"
-                                )
-                            else:
-                                law_cell_parts.append(law_header)
-
-                law_cell = "<br>".join(law_cell_parts) if law_cell_parts else "（无）"
-
-                # ========================================
-                # 建议
-                # ========================================
+                # 处置建议
                 suggestion = evidence_report.get("disposal_suggestion")
                 if suggestion:
-                    suggestion_excerpt = suggestion[:60].strip()
-                    if len(suggestion) > 60:
-                        suggestion_excerpt += "..."
-                    suggestion_cell = _esc_cell(suggestion_excerpt)
+                    suggestion_cell = suggestion.strip()[:40]
+                    if len(suggestion.strip()) > 40:
+                        suggestion_cell += "..."
+                    suggestion_cell = _esc_cell(suggestion_cell)
                 else:
-                    suggestion_cell = "（无）"
+                    suggestion_cell = "-"
 
-                # ========================================
-                # 🔥 证据链（新增列）
-                # ========================================
-                chain_obj = evidence_report.get("evidence_chain")
-                evidence_cell_parts = []
-                if chain_obj:
-                    if isinstance(chain_obj, list):
-                        for i, item in enumerate(chain_obj[:3]):  # 最多 3 条
-                            item_text = str(item)[:50].strip()
-                            if len(str(item)) > 50:
-                                item_text += "..."
-                            evidence_cell_parts.append(f"{i+1}. {_esc_cell(item_text)}")
-                    elif isinstance(chain_obj, str):
-                        chain_excerpt = chain_obj[:100].strip()
-                        if len(chain_obj) > 100:
-                            chain_excerpt += "..."
-                        evidence_cell_parts.append(_esc_cell(chain_excerpt))
-
-                evidence_cell = (
-                    "<br>".join(evidence_cell_parts)
-                    if evidence_cell_parts
-                    else "（无）"
-                )
-
-                # 输出 7 列表格行
-                md += f"| {_esc_cell(note_id)} | {_esc_cell(risk)} | {violation_cell} | {reasoning_cell} | {law_cell} | {suggestion_cell} | {evidence_cell} |\n"
+                md += f"| {case_num} | {_esc_cell(risk)} | {violation_cell} | {reasoning_cell} | {law_cell} | {suggestion_cell} |\n"
 
             md += "\n"
 

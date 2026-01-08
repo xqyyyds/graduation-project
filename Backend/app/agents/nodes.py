@@ -22,12 +22,80 @@ from app.agents.tools import get_web_context  # 工具函数
 # 4. 引入数据库管理器
 from app.db.mongo_manager import mongo_db
 
+# 5. 引入分类服务
+from app.services.category_classifier import category_classifier
+
+
+# =====================================================
+# Node Classify: 热搜分类 (ETL 前置节点)
+# =====================================================
+def classify_node(state: GraphState) -> Dict[str, Any]:
+    """
+    对热搜词条进行分类标注
+    如果用户选择"综合"类别，则跳过分类
+    已有分类的词条不会被覆盖
+    """
+    category = state.get("category")
+    start_str = state.get("start_date")
+    end_str = state.get("end_date")
+
+    # 如果是综合类别，跳过分类
+    if not category or category == "综合":
+        logger.info("\n🏷️ [Node Classify] 综合类别，跳过分类...")
+        return {"current_step": "Classify_Skipped"}
+
+    logger.info(f"\n🏷️ [Node Classify] 启动：热搜分类 (目标类别: {category})...")
+
+    if not start_str or not end_str:
+        now = datetime.now()
+        end_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        start_str = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        # 1. 获取原始热搜数据
+        raw_items = mongo_db.get_raw_trend_items(start_str, end_str)
+        if not raw_items:
+            logger.warning("⚠️ [Node Classify] 无可用数据")
+            return {"current_step": "Classify_Empty"}
+
+        # 2. 提取所有唯一词条
+        all_words = list(
+            set(item.get("word") for item in raw_items if item.get("word"))
+        )
+        logger.info(f"   📥 [Node Classify] 获取到 {len(all_words)} 个唯一热搜词条")
+
+        # 3. 获取已有分类（避免覆盖）
+        existing_categories = mongo_db.get_existing_categories(start_str, end_str)
+        logger.info(
+            f"   📌 [Node Classify] 已有 {len(existing_categories)} 个词条有分类"
+        )
+
+        # 4. 并行调用 LLM 分类（跳过已分类的）
+        category_map = category_classifier.classify_parallel(
+            words=all_words, max_workers=5, existing_categories=existing_categories
+        )
+
+        # 5. 回写到数据库
+        mongo_db.update_hot_search_categories(category_map, start_str, end_str)
+
+        logger.info(f"✅ [Node Classify] 分类完成，共 {len(category_map)} 个词条")
+        return {"current_step": "Classify_Done"}
+
+    except Exception as e:
+        logger.error(f"❌ [Node Classify] 分类失败: {e}")
+        return {"current_step": "Classify_Error"}
+
 
 # =====================================================
 # Node ETL: 数据清洗与归并
 # =====================================================
 def etl_node(state: GraphState) -> Dict[str, Any]:
-    logger.info("\n🧹 [Node ETL] 启动：清洗与归并...")
+    category = state.get("category")
+    category_label = (
+        f"【{category}】" if category and category != "综合" else "【综合】"
+    )
+
+    logger.info(f"\n🧹 [Node ETL] 启动：{category_label} 清洗与归并...")
     start_str = state.get("start_date")
     end_str = state.get("end_date")
 
@@ -37,7 +105,8 @@ def etl_node(state: GraphState) -> Dict[str, Any]:
         start_str = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        events = event_merger.run_merge_task(start_str, end_str)
+        # 传递 category 参数到 ETL
+        events = event_merger.run_merge_task(start_str, end_str, category=category)
         if not events:
             return {"core_events": [], "current_step": "ETL_Empty"}
 

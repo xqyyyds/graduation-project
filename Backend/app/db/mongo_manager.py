@@ -25,20 +25,49 @@ from datetime import timedelta, timezone
 
 
 def _parse_date_or_datetime(value: str) -> datetime:
-    """严格解析日期-only (YYYY-MM-DD)，返回该日 00:00:00 的 tz-aware datetime（+08:00）。
+    """解析日期或日期时间字符串，尽量兼容常见格式：
 
-    任何非 YYYY-MM-DD 格式都会抛出 ValueError。
+    支持：
+      - YYYY-MM-DD                -> 返回该日 00:00:00 (tz +08:00)
+      - YYYY-MM-DD HH:MM:SS       -> 返回对应时刻 (tz +08:00)
+      - YYYY-MM-DDTHH:MM:SS       -> 返回对应时刻 (tz +08:00)
+      - ISO 8601 带时区偏移的格式也会被接受（如 YYYY-MM-DDTHH:MM:SS+08:00）
+
+    当解析到无时区信息的 datetime 时，会默认设置为 +08:00。
+    若字符串为空或无法解析会抛出 ValueError。
     """
     s = (value or "").strip()
     if not s:
         raise ValueError("Empty date string")
 
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        raise ValueError(f"仅支持日期格式 YYYY-MM-DD，收到: {value}")
-
     tz_cn = timezone(timedelta(hours=8))
-    dt = datetime.strptime(s, "%Y-%m-%d")
-    return dt.replace(tzinfo=tz_cn, hour=0, minute=0, second=0, microsecond=0)
+
+    # 1) 直接尝试 ISO 格式（支持 'T' 或空格作为分隔）
+    try:
+        # datetime.fromisoformat 支持 'YYYY-MM-DD'、'YYYY-MM-DD HH:MM:SS' 和带偏移的 ISO
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz_cn)
+        return dt
+    except Exception:
+        pass
+
+    # 2) 常见明确格式： 'YYYY-MM-DD HH:MM:SS'
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=tz_cn)
+    except Exception:
+        pass
+
+    # 3) 只包含日期 YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return dt.replace(tzinfo=tz_cn, hour=0, minute=0, second=0, microsecond=0)
+
+    # 无法解析
+    raise ValueError(
+        f"无法解析的日期格式，支持 YYYY-MM-DD 或 带时间的 ISO 格式，收到: {value}"
+    )
 
 
 class MongoManager:
@@ -127,6 +156,7 @@ class MongoManager:
         """
         获取所有快照中的 top_n 数组，并炸开成平铺列表
         用于给 EventMerger 做本地预聚合
+        返回的每个 item 包含：word, num, collected_at, category(如有)
         """
         snapshots = self.get_raw_hot_searches(start_date, end_date)
         raw_items = []
@@ -139,10 +169,79 @@ class MongoManager:
                             "word": item.get("word"),
                             "num": item.get("num"),
                             "collected_at": snap.get("collected_at"),
+                            "category": item.get("category"),  # 可能为 None
                         }
                     )
 
         return raw_items
+
+    def get_existing_categories(self, start_date: str, end_date: str) -> Dict[str, str]:
+        """
+        获取指定日期范围内已有分类的热搜词条
+        :return: {word: category} 字典
+        """
+        snapshots = self.get_raw_hot_searches(start_date, end_date)
+        existing = {}
+
+        for snap in snapshots:
+            if "top_n" in snap:
+                for item in snap["top_n"]:
+                    word = item.get("word")
+                    category = item.get("category")
+                    if word and category:
+                        existing[word] = category
+
+        return existing
+
+    def update_hot_search_categories(
+        self, category_map: Dict[str, str], start_date: str, end_date: str
+    ):
+        """
+        批量更新热搜词条的类别
+        :param category_map: {word: category} 字典
+        :param start_date: 开始日期
+        :param end_date: 结束日期
+        """
+        if not category_map:
+            logger.warning("⚠️ 无分类数据可更新")
+            return
+
+        # 获取日期范围内的快照
+        snapshots = self.get_raw_hot_searches(start_date, end_date)
+
+        operations = []
+        updated_count = 0
+
+        for snap in snapshots:
+            snap_id = snap.get("_id")
+            top_n = snap.get("top_n", [])
+
+            # 检查是否需要更新
+            needs_update = False
+            new_top_n = []
+
+            for item in top_n:
+                word = item.get("word")
+                if word in category_map and not item.get("category"):
+                    # 需要更新：该词条在 map 中且当前无分类
+                    new_item = dict(item)
+                    new_item["category"] = category_map[word]
+                    new_top_n.append(new_item)
+                    needs_update = True
+                    updated_count += 1
+                else:
+                    new_top_n.append(item)
+
+            if needs_update:
+                operations.append(
+                    UpdateOne({"_id": snap_id}, {"$set": {"top_n": new_top_n}})
+                )
+
+        if operations:
+            result = self.db["hot_trends_history"].bulk_write(operations)
+            logger.info(
+                f"✅ [分类回写] 已更新 {result.modified_count} 个快照，共 {updated_count} 个词条分类"
+            )
 
     def save_core_events(self, events: List[Dict]):
         """

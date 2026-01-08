@@ -234,6 +234,8 @@ class AgentCompliance:
                         "article": meta.get("article", "未知"),
                         "risk_level": risk,
                         "rule": getattr(d, "page_content", "") or "",
+                        # 优先取 metadata.full_desc（init_weibo_rules 写入），否则降级到 behavior，最后用 page_content
+                        "full_desc": meta.get("full_desc","")
                     }
                 )
 
@@ -260,16 +262,13 @@ class AgentCompliance:
             final_overall_risk = "High"
         batch_dict["overall_risk_level"] = final_overall_risk
 
-        # 限制条款数量，防止 token 膨胀
-        if len(matched_laws) > 12:
-            matched_laws = matched_laws[:12]
+        # # 限制条款数量，防止 token 膨胀
+        # if len(matched_laws) > 12:
+        #     matched_laws = matched_laws[:12]
 
         # 3) 生成证据链（结构化 JSON）
         try:
-            # 🔥 修正：移除截断，确保生成完整的证据链
-            # violated_items_trimmed = violated_items[:20]
-
-            # 🔥 升级：使用 with_structured_output
+            # 仍然尝试调用 LLM 生成 reasoning 与处置建议，但强制替换 cited_laws
             structured_llm = self.llm.with_structured_output(ComplianceEvidenceReport)
             prompt = ChatPromptTemplate.from_template(AGENT_C_EVIDENCE_TEMPLATE)
             chain = prompt | structured_llm
@@ -289,9 +288,6 @@ class AgentCompliance:
                 if hasattr(evidence_obj, "model_dump")
                 else dict(evidence_obj)
             )
-            # 🔥 回填整体风险等级 (由 Python 计算，而非 LLM 生成)
-            evidence_report["overall_risk_level"] = final_overall_risk
-
         except Exception as e:
             logger.warning(f"⚠️ [Agent C] 证据链生成失败 (ID: {note_id}): {e}")
             evidence_report = {}
@@ -301,8 +297,6 @@ class AgentCompliance:
             "matched_laws": matched_laws,
             "evidence_report": evidence_report,
         }
-
-    
 
 
 # 单例导出

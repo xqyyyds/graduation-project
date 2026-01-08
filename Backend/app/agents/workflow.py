@@ -5,6 +5,7 @@ from app.agents.state import GraphState
 
 # 2. 引入同级目录下的 Nodes
 from app.agents.nodes import (
+    classify_node,  # 新增：分类节点
     etl_node,
     agent_a_node,
     agent_b_node,
@@ -38,6 +39,7 @@ def create_workflow():
 
     # 2. 注册节点 (Nodes)
     # 这些函数已经在 nodes.py 里定义好了
+    workflow.add_node("node_classify", classify_node)  # Step 0: 热搜分类（ETL 前置）
     workflow.add_node("node_etl", etl_node)  # Step 1: 数据归并
     workflow.add_node("agent_a", agent_a_node)  # Step 2: 热度统计
     workflow.add_node("agent_b", agent_b_node)  # Step 3: 观点分析 (耗时最长)
@@ -47,7 +49,9 @@ def create_workflow():
 
     # 3. 连接边 (Edges)
 
-    workflow.add_edge(START, "node_etl")
+    # 新增：先分类再 ETL
+    workflow.add_edge(START, "node_classify")
+    workflow.add_edge("node_classify", "node_etl")
 
     # 🔥 核心修改：增加条件路由，ETL 失败直接中断
     workflow.add_conditional_edges(

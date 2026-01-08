@@ -17,6 +17,8 @@ def run_task(
     end_date: str = None,
     regenerate_report: bool = False,
     forecast_range: str = "1m",
+    category: str = "综合",
+    progress_callback=None,
 ):
     """
     执行舆情分析全流程
@@ -24,7 +26,16 @@ def run_task(
     :param start_date: 分析开始时间 (YYYY-MM-DD HH:MM:SS)
     :param end_date: 分析结束时间
     :param regenerate_report: 是否仅重新生成报告 (跳过前面的步骤)
+    :param forecast_range: 趋势预测时间范围 (1w/2w/1m/2m)
+    :param category: 热搜类别筛选 (综合/社会/高校/生活/科技/政治/其他)
+    :param progress_callback: 进度回调函数 (progress, step, message)
     """
+
+    def report_progress(progress: int, step: str, message: str):
+        """报告进度"""
+        if progress_callback:
+            progress_callback(progress, step, message)
+        print(f"📊 [{progress}%] {step}: {message}")
 
     # --- 1. ID 初始化 ---
     if not thread_id:
@@ -36,12 +47,19 @@ def run_task(
     else:
         print(f"\n🔄 [System] 正在尝试恢复任务...")
 
+    report_progress(5, "初始化", "正在准备任务环境...")
+
+    category_label = (
+        f"【{category}】" if category and category != "综合" else "【综合】"
+    )
     print(f"🆔 任务 ID (Thread ID): {thread_id}")
     print(f"📅 分析周期: {start_date or '默认(最近24h)'} ~ {end_date or '默认'}")
+    print(f"🏷️ 类别筛选: {category_label}")
     print("-" * 50)
 
     # --- 2. 注入记忆 & 编译图 ---
     # 使用上下文管理器打开 SQLite 连接
+    report_progress(10, "初始化", "正在连接数据库...")
     with checkpointer_manager.get_checkpointer() as checkpointer:
 
         # 🔥 关键：在这里把 workflow 编译成可运行的 app，并挂载记忆
@@ -84,6 +102,7 @@ def run_task(
             "start_date": start_date,
             "end_date": end_date,
             "forecast_range": forecast_range,  # 预测时间范围
+            "category": category,  # 类别筛选
             # 初始化空列表，防止首次运行报错
             "messages": [],
             "core_events": [],
@@ -98,7 +117,18 @@ def run_task(
         # 配置信息 (告诉 LangGraph 当前是哪个线程)
         config = {"configurable": {"thread_id": thread_id}}
 
+        # 节点名称到进度的映射
+        node_progress_map = {
+            "data_collector": (15, "数据采集", "正在采集热搜数据..."),
+            "agent_a": (30, "热度统计", "Agent A 正在分析热度数据..."),
+            "agent_b": (50, "观点分析", "Agent B 正在进行深度观点分析..."),
+            "agent_c": (65, "合规审查", "Agent C 正在进行合规性审查..."),
+            "agent_d": (80, "趋势预测", "Agent D 正在预测舆情趋势..."),
+            "agent_e": (90, "报告生成", "Agent E 正在生成研判报告..."),
+        }
+
         # --- 4. 启动流式运行 ---
+        report_progress(12, "数据采集", "正在启动工作流...")
         try:
             # app.stream 会一步步执行节点
             # stream_mode="updates" 表示只返回状态更新的部分
@@ -112,9 +142,23 @@ def run_task(
                         f"✅ [Step {step_count}] 节点 '{node_name}' 完成 -> {step_info}"
                     )
 
+                    # 报告进度
+                    if node_name in node_progress_map:
+                        prog, step, msg = node_progress_map[node_name]
+                        report_progress(prog, step, f"{step}完成")
+                    else:
+                        # 尝试从 state_delta 获取步骤信息
+                        current_step = state_delta.get("current_step", "处理中")
+                        report_progress(
+                            min(15 + step_count * 10, 95),
+                            current_step,
+                            f"节点 {node_name} 处理完成",
+                        )
+
             # --- 5. 任务结束 ---
             print("-" * 50)
             print(f"✨✨ 全流程执行完毕！ ✨✨")
+            report_progress(98, "完成", "正在保存最终结果...")
 
             # 获取最终状态以打印 PDF 路径
             final_snapshot = app.get_state(config)
@@ -127,6 +171,7 @@ def run_task(
                 print(f"📂 请前往项目 output/ 目录查看最新生成的 PDF 报告。")
 
             print(f"💡 提示：保留 ID '{thread_id}'，下次运行时传入可回溯历史。")
+            report_progress(100, "完成", "报告生成成功！")
 
         except KeyboardInterrupt:
             print("\n\n🛑 [System] 用户手动中止任务。")
@@ -180,6 +225,13 @@ if __name__ == "__main__":
         default="1m",
         help="趋势预测时间范围：1w=一周, 2w=半个月, 1m=一个月, 2m=两个月 (默认1m)",
     )
+    parser.add_argument(
+        "--category",
+        type=str,
+        choices=["综合", "社会", "高校", "生活", "科技", "政治", "其他"],
+        default="综合",
+        help="热搜类别筛选：综合=全部, 社会/高校/生活/科技/政治/其他 (默认综合)",
+    )
 
     args = parser.parse_args()
 
@@ -214,4 +266,5 @@ if __name__ == "__main__":
         end_date=e_date,
         regenerate_report=args.regenerate_report,
         forecast_range=args.forecast,
+        category=args.category,
     )

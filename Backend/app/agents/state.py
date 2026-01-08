@@ -1,9 +1,14 @@
 import operator
-from typing import List, Dict, Any, Annotated, TypedDict, Optional
+from typing import List, Dict, Any, Annotated, TypedDict, Optional, Literal
 
 # 🔥 新增导入：LangGraph 的消息管理利器
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
+
+
+# 有效类别常量定义
+VALID_CATEGORIES = ["综合", "社会", "高校", "生活", "科技", "政治", "其他"]
+CategoryType = Literal["综合", "社会", "高校", "生活", "科技", "政治", "其他"]
 
 
 # 定义状态字典
@@ -25,6 +30,9 @@ class GraphState(TypedDict):
 
     # 🔥 [新增] 趋势预测时间范围 (1w/2w/1m/2m)
     forecast_range: Optional[str]  # "1w", "2w", "1m", "2m"
+
+    # 🔥 [新增] 类别筛选 (综合/社会/高校/生活/科技/政治/其他)
+    category: Optional[str]  # 默认 "综合" 表示不筛选类别
 
     # === 3. Agent A (统计分析师) 的产出 ===
     raw_trends: List[Dict]
