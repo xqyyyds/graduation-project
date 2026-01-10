@@ -652,13 +652,25 @@ em { color: #666; }
 
                 violated_comment_originals = v.get("violated_comment_originals", [])
                 seen_comments = set()
+                comment_count = 0
                 if violated_comment_originals:
                     for vc in violated_comment_originals:
-                        content = (vc.get("content") or "").strip()
-                        # 保留所有去重后的评论（取消任何后端长度限制），前端负责展示与截断
-                        if content and content not in seen_comments:
+                        content = vc.get("content", "")
+                        if (
+                            content
+                            and content not in seen_comments
+                            and comment_count < 2
+                        ):
                             seen_comments.add(content)
-                            violation_text_parts.append(f"【评】{_esc_cell(content)}")
+                            comment_count += 1
+                            truncated = content.strip()[:50]
+                            if len(content.strip()) > 50:
+                                truncated += "..."
+                            violation_text_parts.append(f"【评】{_esc_cell(truncated)}")
+                    if len(violated_comment_originals) > 2:
+                        violation_text_parts.append(
+                            f"...等{len(violated_comment_originals)}条"
+                        )
 
                 violation_cell = (
                     "<br>".join(violation_text_parts) if violation_text_parts else "-"

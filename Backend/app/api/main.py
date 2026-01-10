@@ -338,6 +338,33 @@ async def get_dashboard_stats():
     )
 
 
+@app.get("/api/dashboard/latest-report/violations")
+async def get_latest_report_violations():
+    """返回最新 report_session 中持久化的违规类别合计统计（直接复用 Agent E 计算结果）。
+    返回格式: { "category_counts": {cat: count}, "total_violated_posts": int, "total_violated_comments": int }
+    如果不存在结构化统计，返回 { "category_counts": {} }（不再做 MD 解析回退）。"""
+    try:
+        sessions = mongo_db.get_report_history(limit=1)
+        if sessions:
+            latest_session = sessions[0]
+            counts = latest_session.get("violation_category_counts")
+            if isinstance(counts, dict):
+                return {
+                    "category_counts": counts,
+                    "total_violated_posts": latest_session.get(
+                        "total_violated_posts", 0
+                    ),
+                    "total_violated_comments": latest_session.get(
+                        "total_violated_comments", 0
+                    ),
+                }
+    except Exception as e:
+        add_system_log("ERROR", f"读取 report_sessions 失败: {e}")
+
+    # 未找到结构化统计，按要求不再回退解析 Markdown，直接返回空对象
+    return {"category_counts": {}}
+
+
 @app.post("/api/tasks", response_model=TaskStatus)
 async def create_task(params: TaskCreate, background_tasks: BackgroundTasks):
     """创建新的研判任务"""
@@ -516,12 +543,23 @@ async def get_forecast_ranges():
 # =====================================================
 
 
+from typing import Optional
+
+
 class LLMSettings(BaseModel):
     """LLM 配置"""
 
     model: str
     base_url: str
     api_key: str
+
+
+class LLMTestParams(BaseModel):
+    """用于测试的可选参数（允许不保存直接测试）"""
+
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 @app.get("/api/settings/llm")
@@ -566,28 +604,107 @@ async def update_llm_settings(llm_settings: LLMSettings):
 
 
 @app.post("/api/settings/llm/test")
-async def test_llm_connection():
-    """测试 LLM 连接"""
+async def test_llm_connection(params: LLMTestParams):
+    """测试 LLM 连接。优先使用传入参数，否则退回到当前 server 配置。增强：先使用 openai SDK 做一次简单请求以捕获认证/地址错误，失败则回退到 langchain 的调用，同时对返回内容做基本检查。"""
     from app.core.config import settings
 
+    # 决定使用的配置（传入优先）
+    model = params.model or settings.LLM_MODEL
+    base_url = params.base_url or settings.LLM_BASE_URL
+    api_key = (
+        params.api_key
+        if params.api_key and "*" not in params.api_key
+        else settings.ZHIPU_API_KEY
+    )
+
+    # 记录收到的参数（不记录完整密钥以防泄漏）
+    from app.core.logger import logger
+
+    logger.info(
+        f"LLM 测试请求: model={model}, base_url={'(present)' if base_url else '(none)'}, api_key_present={'yes' if api_key else 'no'}"
+    )
+
+    # 1) 尝试使用 openai SDK 发起最小化请求以捕获常见错误
+    openai_err = None
+    try:
+        import openai
+
+        if api_key:
+            openai.api_key = api_key
+        if base_url:
+            openai.api_base = base_url.rstrip("/")
+
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role": "user", "content": "请回复：连接成功。"}],
+            max_tokens=10,
+            temperature=0,
+        )
+
+        content = None
+        if isinstance(resp, dict) and resp.get("choices"):
+            content = (
+                resp["choices"][0]["message"]["content"]
+                if resp["choices"][0].get("message")
+                else str(resp)
+            )
+        else:
+            content = str(resp)
+
+        low = (content or "").lower()
+        if "连接成功" in low or "success" in low or "ok" in low:
+            return {
+                "status": "ok",
+                "message": "LLM 连接成功",
+                "response": (content or "").strip()[:200],
+            }
+        else:
+            return {
+                "status": "ok",
+                "message": "LLM 连接成功（返回内容未包含显式成功关键字）",
+                "response": (content or "").strip()[:200],
+            }
+
+    except Exception as e_open:
+        openai_err = str(e_open)
+        logger.error(f"openai 测试失败: {openai_err}")
+
+    # 2) 回退到 langchain_openai（兼容性）
     try:
         from langchain_openai import ChatOpenAI
 
         llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,
+            model=model,
+            openai_api_key=api_key,
+            openai_api_base=base_url,
             temperature=0,
             max_tokens=50,
         )
         response = llm.invoke("你好，请回复'连接成功'")
+        content = getattr(response, "content", None) or str(response)
+        low = (content or "").lower()
+        if "连接成功" in low or "success" in low or "ok" in low:
+            logger.info("LLM 测试通过（langchain 返回）")
+            return {
+                "status": "ok",
+                "message": "LLM 连接成功",
+                "response": (content or "").strip()[:200],
+            }
+        else:
+            logger.warning(f"LLM 返回结果未包含成功关键字: {content}")
+            return {
+                "status": "ok",
+                "message": "LLM 连接成功（返回内容未包含显式成功关键字）",
+                "response": (content or "").strip()[:200],
+                "openai_error": openai_err,
+            }
+
+    except Exception as e_chain:
+        logger.error(f"langchain 回退测试失败: {e_chain}")
         return {
-            "status": "ok",
-            "message": "LLM 连接成功",
-            "response": response.content[:100],
+            "status": "error",
+            "message": f"连接失败: openai_error: {openai_err}; fallback_error: {str(e_chain)}",
         }
-    except Exception as e:
-        return {"status": "error", "message": f"连接失败: {str(e)}"}
 
 
 if __name__ == "__main__":

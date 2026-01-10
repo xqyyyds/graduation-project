@@ -1,340 +1,255 @@
 <template>
-  <div class="logs-page">
-    <!-- 页面标题 -->
-    <div class="page-header">
-      <div class="header-left">
-        <h1 class="page-title">系统日志</h1>
-        <p class="page-desc">实时查看后端运行状态和任务执行日志</p>
+  <div class="logs-container">
+    <div class="logs-toolbar">
+      <div class="toolbar-left">
+        <h2 class="terminal-title">
+          <el-icon><Monitor /></el-icon> SYSTEM KERNEL LOGS
+        </h2>
       </div>
-      <div class="header-right">
-        <el-tag :type="connected ? 'success' : 'danger'" effect="plain">
-          <el-icon><Connection /></el-icon>
-          {{ connected ? "已连接" : "未连接" }}
-        </el-tag>
-        <el-button @click="clearLogs" :disabled="logs.length === 0">
-          <el-icon><Delete /></el-icon>
-          清空日志
-        </el-button>
-        <el-switch
-          v-model="autoScroll"
-          active-text="自动滚动"
-          inactive-text=""
-        />
+      <div class="toolbar-right">
+        <div class="connection-status" :class="{ active: connected }">
+          <span class="status-dot"></span>
+          {{ connected ? 'CONNECTED' : 'DISCONNECTED' }}
+        </div>
+        <el-divider direction="vertical" />
+        <el-switch v-model="autoScroll" active-text="Auto-Scroll" size="small" />
+        <el-button type="danger" size="small" plain @click="clearLogs" :icon="Delete">Clear</el-button>
       </div>
     </div>
 
-    <!-- 日志终端 -->
-    <el-card class="terminal-card" shadow="never">
-      <div class="terminal" ref="terminalRef">
-        <div
-          v-for="(log, index) in logs"
-          :key="index"
-          class="log-line"
-          :class="getLogClass(log.level)"
-        >
-          <span class="log-time">{{ log.timestamp }}</span>
-          <span class="log-level">{{ log.level }}</span>
-          <span class="log-message">{{ log.message }}</span>
+    <div class="terminal-window" ref="terminalRef">
+      <div class="terminal-content">
+        <div v-if="logs.length === 0" class="terminal-placeholder">
+          <el-icon :size="60"><Promotion /></el-icon>
+          <p>Waiting for data stream...</p>
         </div>
-        <div v-if="logs.length === 0" class="empty-logs">
-          <el-icon :size="48" color="#9ca3af"><Monitor /></el-icon>
-          <p>暂无日志，等待后端输出...</p>
+        
+        <div v-for="(log, index) in logs" :key="index" class="log-row" :class="getLogClass(log.level)">
+          <span class="log-gutter">{{ index + 1 }}</span>
+          <span class="log-time">[{{ log.timestamp }}]</span>
+          <span class="log-level">{{ log.level }}</span>
+          <span class="log-msg">{{ log.message }}</span>
         </div>
       </div>
-    </el-card>
+    </div>
 
-    <!-- 统计信息 -->
-    <div class="logs-stats">
-      <span>共 {{ logs.length }} 条日志</span>
-      <span class="stat-item info">
-        <el-icon><InfoFilled /></el-icon>
-        INFO: {{ countByLevel("INFO") }}
-      </span>
-      <span class="stat-item warning">
+    <div class="status-bar">
+      <div class="sb-section">
+        <el-icon><List /></el-icon>
+        <span>Total: {{ logs.length }}</span>
+      </div>
+      <div class="sb-section info">
+        <span>INFO: {{ countByLevel("INFO") }}</span>
+      </div>
+      <div class="sb-section warning" v-if="countByLevel('WARNING') > 0">
         <el-icon><Warning /></el-icon>
-        WARNING: {{ countByLevel("WARNING") }}
-      </span>
-      <span class="stat-item error">
+        <span>WARN: {{ countByLevel("WARNING") }}</span>
+      </div>
+      <div class="sb-section error" v-if="countByLevel('ERROR') > 0">
         <el-icon><CircleClose /></el-icon>
-        ERROR: {{ countByLevel("ERROR") }}
-      </span>
+        <span>ERR: {{ countByLevel("ERROR") }}</span>
+      </div>
+      <div class="sb-spacer"></div>
+      <div class="sb-section">
+        <span>UTF-8</span>
+      </div>
+      <div class="sb-section">
+        <span>Port: 8000</span>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
+import { Delete, Monitor, Promotion, Warning, CircleClose, List } from '@element-plus/icons-vue';
 
+// 核心数据
 const logs = ref([]);
 const connected = ref(false);
 const autoScroll = ref(true);
 const terminalRef = ref(null);
 
+// WebSocket 变量
 let ws = null;
 let reconnectTimer = null;
+let heartbeatTimer = null;
 
-// 连接 WebSocket
+// 1. 真实的 WebSocket 连接逻辑
 const connectWebSocket = () => {
   if (ws && ws.readyState === WebSocket.OPEN) return;
 
+  // ⚠️ 连接到你的真实后端地址
   ws = new WebSocket("ws://localhost:8000/ws/logs");
 
   ws.onopen = () => {
     connected.value = true;
-    console.log("WebSocket 已连接");
+    console.log("System Terminal: Connection Established.");
+    startHeartbeat();
   };
 
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
+      
+      // 添加日志到数组
       logs.value.push(data);
 
-      // 限制日志数量
+      // 性能优化：限制前端只保留最近 1000 条日志
       if (logs.value.length > 1000) {
         logs.value = logs.value.slice(-800);
       }
 
-      // 自动滚动
+      // 自动滚动处理
       if (autoScroll.value) {
         nextTick(() => {
           scrollToBottom();
         });
       }
     } catch (e) {
-      // 可能是 pong 响应
+      // 忽略非 JSON 格式的心跳响应 (pong)
     }
   };
 
   ws.onclose = () => {
     connected.value = false;
-    console.log("WebSocket 已断开，5秒后重连...");
+    console.warn("System Terminal: Connection Lost. Retrying in 5s...");
+    stopHeartbeat();
+    // 断线重连机制
     reconnectTimer = setTimeout(connectWebSocket, 5000);
   };
 
   ws.onerror = (error) => {
-    console.error("WebSocket 错误:", error);
+    console.error("WebSocket Error:", error);
     connected.value = false;
   };
 };
 
-// 发送心跳
+// 2. 心跳保活 (防止长时间无日志自动断开)
 const startHeartbeat = () => {
-  setInterval(() => {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send("ping");
     }
-  }, 30000);
+  }, 30000); // 30秒一次
 };
 
-// 滚动到底部
+const stopHeartbeat = () => {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+};
+
+// 3. 辅助功能
 const scrollToBottom = () => {
   if (terminalRef.value) {
     terminalRef.value.scrollTop = terminalRef.value.scrollHeight;
   }
 };
 
-// 清空日志
 const clearLogs = () => {
   logs.value = [];
 };
 
-// 根据级别获取样式类
-const getLogClass = (level) => {
-  const map = {
-    INFO: "log-info",
-    WARNING: "log-warning",
-    WARN: "log-warning",
-    ERROR: "log-error",
-    DEBUG: "log-debug",
-  };
-  return map[level] || "log-info";
-};
-
-// 统计某级别日志数量
-const countByLevel = (level) => {
-  return logs.value.filter((l) => l.level === level).length;
-};
-
-// 监听自动滚动变化
-watch(autoScroll, (val) => {
-  if (val) {
-    nextTick(() => {
-      scrollToBottom();
-    });
+// 统计逻辑
+const countByLevel = (lvl) => {
+  if (lvl === 'WARNING') {
+    return logs.value.filter(l => l.level === 'WARNING' || l.level === 'WARN').length;
   }
+  return logs.value.filter(l => l.level === lvl).length;
+};
+
+// 样式映射
+const getLogClass = (lvl) => {
+  const map = { 
+    'INFO': 'l-info', 
+    'WARNING': 'l-warn', 'WARN': 'l-warn',
+    'ERROR': 'l-err', 
+    'DEBUG': 'l-debug' 
+  };
+  return map[lvl] || 'l-info';
+};
+
+// 监听自动滚动开关
+watch(autoScroll, (val) => {
+  if (val) nextTick(scrollToBottom);
 });
 
+// 生命周期管理
 onMounted(() => {
   connectWebSocket();
   startHeartbeat();
 });
 
 onBeforeUnmount(() => {
-  if (ws) {
-    ws.close();
-  }
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-  }
+  if (ws) ws.close();
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  stopHeartbeat();
 });
 </script>
 
 <style scoped>
-.logs-page {
-  max-width: 1400px;
-  margin: 0 auto;
+.logs-container {
+  display: flex; flex-direction: column; height: calc(100vh - 120px); /* 减去顶部Header高度 */
+  background: #1e1e1e; border-radius: 12px; overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.2); border: 1px solid #333;
 }
 
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 24px;
+/* 工具栏 */
+.logs-toolbar {
+  height: 48px; background: #252526; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 16px; border-bottom: 1px solid #333;
 }
+.terminal-title {
+  color: #ccc; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; margin: 0; letter-spacing: 0.5px;
+}
+.toolbar-right { display: flex; align-items: center; gap: 12px; }
 
-.page-title {
-  font-size: 24px;
-  font-weight: 600;
-  color: #1f2937;
-  margin: 0 0 8px 0;
-}
+.connection-status { font-size: 12px; color: #666; display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.connection-status.active { color: #10b981; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
-.page-desc {
-  font-size: 14px;
-  color: #6b7280;
-  margin: 0;
+/* 终端窗口 */
+.terminal-window {
+  flex: 1; overflow-y: auto; padding: 10px 0;
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  font-size: 13px; line-height: 1.5; color: #d4d4d4;
+  background-image: repeating-linear-gradient(0deg, transparent, transparent 1px, #222 1px, #222 2px); /* 扫描线效果微弱背景 */
+  background-size: 100% 4px;
 }
+.terminal-content { padding: 0 16px; }
 
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-/* 终端样式 */
-.terminal-card {
-  margin-bottom: 16px;
-}
-
-.terminal {
-  background: #1e1e1e;
-  border-radius: 8px;
-  padding: 16px;
-  height: 500px;
-  overflow-y: auto;
-  font-family: "Cascadia Code", "Fira Code", "Monaco", "Consolas", monospace;
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-/* 滚动条样式 */
-.terminal::-webkit-scrollbar {
-  width: 8px;
-}
-
-.terminal::-webkit-scrollbar-track {
-  background: #2d2d2d;
-  border-radius: 4px;
-}
-
-.terminal::-webkit-scrollbar-thumb {
-  background: #555;
-  border-radius: 4px;
-}
-
-.terminal::-webkit-scrollbar-thumb:hover {
-  background: #666;
-}
+/* 滚动条 */
+.terminal-window::-webkit-scrollbar { width: 10px; background: #1e1e1e; }
+.terminal-window::-webkit-scrollbar-thumb { background: #424242; border-radius: 5px; border: 2px solid #1e1e1e; }
 
 /* 日志行 */
-.log-line {
-  display: flex;
-  gap: 12px;
-  padding: 2px 0;
-  word-break: break-all;
+.log-row { display: flex; gap: 12px; padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.02); }
+.log-row:hover { background: rgba(255,255,255,0.05); }
+
+.log-gutter { color: #555; width: 40px; text-align: right; user-select: none; font-size: 12px; }
+.log-time { color: #569cd6; }
+.log-level { width: 60px; font-weight: bold; }
+.log-msg { white-space: pre-wrap; word-break: break-all; flex: 1; }
+
+.l-info .log-level { color: #4fc1ff; }
+.l-warn .log-level { color: #dcdcaa; }
+.l-warn .log-msg { color: #dcdcaa; }
+.l-err .log-level { color: #f44747; }
+.l-err .log-msg { color: #ff8080; }
+
+.terminal-placeholder {
+  height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  color: #444; margin-top: 100px;
 }
 
-.log-time {
-  color: #858585;
-  flex-shrink: 0;
+/* 底部状态栏 */
+.status-bar {
+  height: 24px; background: #007acc; color: #fff; display: flex; align-items: center;
+  font-family: sans-serif; font-size: 11px; padding: 0 8px; cursor: default;
 }
-
-.log-level {
-  min-width: 60px;
-  flex-shrink: 0;
-  font-weight: 600;
-}
-
-.log-message {
-  color: #d4d4d4;
-}
-
-/* 日志级别颜色 */
-.log-info .log-level {
-  color: #4fc1ff;
-}
-
-.log-warning .log-level {
-  color: #f59e0b;
-}
-
-.log-warning .log-message {
-  color: #fcd34d;
-}
-
-.log-error .log-level {
-  color: #ef4444;
-}
-
-.log-error .log-message {
-  color: #fca5a5;
-}
-
-.log-debug .log-level {
-  color: #a78bfa;
-}
-
-/* 空状态 */
-.empty-logs {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  color: #6b7280;
-}
-
-.empty-logs p {
-  margin-top: 16px;
-}
-
-/* 统计信息 */
-.logs-stats {
-  display: flex;
-  align-items: center;
-  gap: 24px;
-  padding: 12px 16px;
-  background: #f9fafb;
-  border-radius: 8px;
-  font-size: 14px;
-  color: #6b7280;
-}
-
-.stat-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.stat-item.info {
-  color: #3b82f6;
-}
-
-.stat-item.warning {
-  color: #f59e0b;
-}
-
-.stat-item.error {
-  color: #ef4444;
-}
+.sb-section { padding: 0 8px; display: flex; align-items: center; gap: 4px; height: 100%; }
+.sb-section:hover { background: rgba(255,255,255,0.1); }
+.sb-section.warning { background: #cca700; }
+.sb-section.error { background: #c90000; }
+.sb-spacer { flex: 1; }
 </style>
