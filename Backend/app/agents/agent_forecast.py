@@ -1,11 +1,9 @@
 import datetime
+from typing import Dict, Any, Optional
 from dateutil.relativedelta import relativedelta
-from typing import Dict, Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-
-# from langchain_core.output_parsers import JsonOutputParser # 已移除
 
 from app.core.config import settings
 from app.core.logger import logger
@@ -31,8 +29,6 @@ class AgentForecast:
             request_timeout=180,  # 🔥 增加超时时间
             max_retries=3,
         )
-        # 移除旧的 parser
-        # self.parser = JsonOutputParser(pydantic_object=TrendForecastReport)
 
     def run(
         self,
@@ -41,13 +37,14 @@ class AgentForecast:
         history_context: str = "",
         future_context: str = "",
         forecast_range: str = "1m",
+        time_period_desc: Optional[str] = None,
+        category: str = "综合",
     ) -> Dict[str, Any]:
-        logger.info("🔮 [Agent D] 启动全域时空研判系统 (Master CoT Mode)...")
+        
+        logger.info(f"🔮 [Agent D] 启动{category}领域研判 (Master CoT Mode)...")
 
-        # 1. 根据预测范围锁定时间坐标
+        # 1. 时间计算逻辑 (保留用于计算 target_period，但 target_year/month 变量本身不再传给 Prompt)
         now = datetime.datetime.now()
-
-        # 解析预测范围
         range_map = {
             "1w": ("一周", 7, "days"),
             "2w": ("半个月", 14, "days"),
@@ -63,58 +60,67 @@ class AgentForecast:
         else:
             target_date = now + relativedelta(months=delta_val)
 
-        target_year = target_date.year
-        target_month = target_date.month
+        # 构造目标时间描述 (target_period)
+        # 优先使用传入的精准描述 (time_period_desc)，否则兜底生成
+        if time_period_desc:
+            base_period = time_period_desc
+        else:
+            base_period = f"{now.strftime('%Y年%m月%d日')}起未来{range_desc}"
 
-        # 构造目标时间描述
-        target_period = f"{now.strftime('%Y年%m月%d日')}起未来{range_desc}"
+        # 处理领域前缀
+        if category and category not in ["综合", "其他", "全部"]:
+            final_target_period = f"【{category}领域】{base_period}"
+            final_future_context = f"以下是{category}领域的全网情报：\n{future_context}"
+        else:
+            final_target_period = base_period
+            final_future_context = future_context
 
-        logger.info(f"📅 [Agent D] 研判目标: {target_period}")
+        logger.info(f"📅 [Agent D] 研判目标: {final_target_period}")
 
         # 2. 构造 Prompt 链
-        # 🔥 升级：使用 with_structured_output，不再需要 format_instructions
         structured_llm = self.llm.with_structured_output(TrendForecastReport)
         prompt = ChatPromptTemplate.from_template(AGENT_D_FORECAST_TEMPLATE)
-
         chain = prompt | structured_llm
 
         try:
             # 3. 执行推理
+            # 🔥🔥🔥【修改】移除了 target_year 和 target_month，与 Prompt 保持一致 🔥🔥🔥
             report_obj = chain.invoke(
                 {
-                    "target_year": target_year,
-                    "target_month": target_month,
                     "forecast_range": range_desc,
-                    "target_period": target_period,
+                    "target_period": final_target_period,
                     "current_opinion_analysis": current_opinion_analysis,
                     "audit_risks": audit_risks,
                     "history_context": history_context,
-                    "future_context": future_context,
+                    "future_context": final_future_context,
                 }
             )
 
             logger.info("✅ [Agent D] 深度战略研判完成 (JSON Generated)。")
 
-            # 转换为字典
             report = (
                 report_obj.model_dump()
                 if hasattr(report_obj, "model_dump")
                 else dict(report_obj)
             )
 
-            # 🔥 将上下文挂载到返回结果中，供报告生成使用
+            # 挂载上下文 (供 Agent E 报告生成使用)
             report["_context_history"] = history_context
             report["_context_future"] = future_context
             report["_forecast_range"] = range_desc
+            
+            # 为了防止 Agent E 找不到 target_month 报错，或者显示为空，
+            # 我们可以把 final_target_period 赋值给 target_month (如果 LLM 返回空的话)
+            if not report.get("target_month"):
+                report["target_month"] = final_target_period
 
             return report
 
         except Exception as e:
             logger.error(f"❌ [Agent D] 结构化解析失败: {e}")
-            # 降级返回，保证流程不断 (适配新 Schema)
             return {
-                "target_month": target_period,
-                "topics": [],  # 新 Schema 只有 topics
+                "target_month": final_target_period,
+                "topics": [],
             }
 
 

@@ -62,8 +62,8 @@
           <template #header>
             <div class="card-header">
               <div class="title-group">
-                <el-icon class="header-icon"><TrendCharts /></el-icon>
-                <span>舆情类别分布趋势</span>
+                <el-icon class="header-icon" style="color: #ef4444"><Warning /></el-icon>
+                <span>高频违规类别 TOP8 (Risk Stats)</span>
               </div>
             </div>
           </template>
@@ -150,7 +150,7 @@
             <div class="card-header">
               <div class="title-group">
                 <el-icon class="header-icon"><PieChart /></el-icon>
-                <span>热搜类别占比</span>
+                <span>研判报告分类占比</span>
               </div>
             </div>
           </template>
@@ -226,6 +226,8 @@ import { useAppStore } from "../stores/app";
 import * as echarts from "echarts";
 import dayjs from "dayjs";
 import "dayjs/locale/zh-cn";
+// 🔥 引入新图标 Warning
+import { Warning, PieChart, TrendCharts, List, ArrowRight, Right, Lightning, Plus, FolderOpened, Setting } from "@element-plus/icons-vue";
 
 dayjs.locale("zh-cn");
 
@@ -279,15 +281,26 @@ const statCards = computed(() => [
 const initCharts = () => {
   if (!trendChartRef.value || !pieChartRef.value) return;
 
+  // 1. 左侧条形图：使用 violation_distribution (违规数据)
   trendChart = echarts.init(trendChartRef.value);
-  const categoryNames = Object.keys(stats.value.category_distribution || {});
-  const categoryValues = Object.values(stats.value.category_distribution || {});
+  
+  // 获取数据并排序，取 Top 8
+  const rawViolations = stats.value.violation_distribution || {};
+  const sortedViolations = Object.entries(rawViolations)
+    .sort((a, b) => b[1] - a[1]) // 降序
+    .slice(0, 8); // 取前8
+    
+  const barX = sortedViolations.map(item => item[0]);
+  const barY = sortedViolations.map(item => item[1]);
 
   const trendOption = {
     backgroundColor: "transparent",
-    tooltip: { trigger: "axis" },
+    tooltip: { 
+      trigger: "axis",
+      axisPointer: { type: 'shadow' }
+    },
     grid: {
-      top: "10%",
+      top: "15%",
       left: "2%",
       right: "4%",
       bottom: "2%",
@@ -295,47 +308,54 @@ const initCharts = () => {
     },
     xAxis: {
       type: "category",
-      data: categoryNames.length ? categoryNames : ["暂无数据"],
+      data: barX.length ? barX : ["暂无违规数据"],
       axisLine: { show: false },
       axisTick: { show: false },
-      axisLabel: { color: "#94a3b8", interval: 0 },
+      axisLabel: { 
+        color: "#64748b", 
+        interval: 0,
+        fontWeight: 500
+      },
     },
     yAxis: {
       type: "value",
       splitLine: {
-        lineStyle: { type: "dashed", color: "#334155", opacity: 0.3 },
+        lineStyle: { type: "dashed", color: "#334155", opacity: 0.2 },
       },
       axisLabel: { color: "#94a3b8" },
     },
     series: [
       {
-        name: "报告数量",
+        name: "违规次数",
         type: "bar",
-        barWidth: "40%",
-        data: categoryValues.length ? categoryValues : [0],
+        barWidth: "30%", // 柱子细一点更精致
+        data: barY.length ? barY : [0],
         itemStyle: {
+          // 使用红色渐变，突出“违规/警告”含义
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: "#3b82f6" },
-            { offset: 1, color: "#60a5fa" },
+            { offset: 0, color: "#ef4444" },  // 红色
+            { offset: 1, color: "#fca5a5" },  // 浅红
           ]),
           borderRadius: [4, 4, 0, 0],
         },
+        // 显示柱状图顶部的数字
+        label: {
+            show: true,
+            position: 'top',
+            color: '#ef4444'
+        }
       },
     ],
   };
   trendChart.setOption(trendOption);
 
+  // 2. 右侧饼图：使用 category_distribution (报告分类数据)
   pieChart = echarts.init(pieChartRef.value);
-  const sourceForPie =
-    stats.value.latest_report_category_violations &&
-    Object.keys(stats.value.latest_report_category_violations).length
-      ? stats.value.latest_report_category_violations
-      : stats.value.category_distribution || {};
-
-  const pieData = Object.entries(sourceForPie)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([name, value]) => ({ name, value }));
+  
+  const rawCategories = stats.value.category_distribution || {};
+  const pieData = Object.entries(rawCategories)
+    .map(([name, value]) => ({ name, value }))
+    .sort((a, b) => b.value - a.value);
 
   const pieOption = {
     backgroundColor: "transparent",
@@ -344,18 +364,19 @@ const initCharts = () => {
       bottom: "0%",
       left: "center",
       icon: "circle",
-      itemGap: 20,
+      itemGap: 15,
       textStyle: { color: "#94a3b8" },
     },
-    color: ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"],
+    // 调整一下颜色，使其看起来更协调
+    color: ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4", "#6366f1"],
     series: [
       {
-        name: "类别分布",
+        name: "报告分类",
         type: "pie",
-        radius: ["45%", "70%"],
+        radius: ["40%", "65%"], // 空心圆环
         center: ["50%", "45%"],
         itemStyle: {
-          borderRadius: 8,
+          borderRadius: 6,
           borderColor: "var(--bg-card)",
           borderWidth: 2,
         },
@@ -363,12 +384,12 @@ const initCharts = () => {
         emphasis: {
           label: {
             show: true,
-            fontSize: 14,
+            fontSize: 16,
             fontWeight: "bold",
             color: "inherit",
           },
           scale: true,
-          scaleSize: 10,
+          scaleSize: 8,
         },
         data: pieData.length ? pieData : [{ value: 0, name: "暂无数据" }],
       },

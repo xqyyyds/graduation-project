@@ -58,3 +58,24 @@ def get_web_context(query: str) -> str:
         logger.error(f"❌ 联网搜索发生异常: {e}")
         # 返回给 LLM 的提示，让它知道发生了什么，而不是直接报错崩溃
         return f"（由于网络或服务异常，联网搜索暂时不可用。异常信息: {str(e)}）"
+
+
+def normalize_category(cat: str) -> str:
+    """归一化违规类别文本（去首尾空白/标点、统一连字符、替换全角空格等）。
+
+    目标：避免微小字符差异导致相同类别被拆成多个桶。
+    """
+    if not cat:
+        return "其他"
+
+    s = str(cat).strip()
+    # 全角空格 -> 半角
+    s = s.replace("\u3000", " ")
+    # 统一短横与破折号为半角连字符
+    s = s.replace("–", "-").replace("—", "-").replace("－", "-")
+    # 去掉常见尾部标点（中英文）及多余空白
+    s = s.strip().rstrip(".。,，、:：;；")
+    # 收尾再次去空格
+    s = s.strip()
+    # 如果最终为空则返回默认
+    return s if s else "其他"

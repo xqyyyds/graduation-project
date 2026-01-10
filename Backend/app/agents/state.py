@@ -52,6 +52,9 @@ class GraphState(TypedDict):
     # === 7. Agent E (前言/最终报告) 的产出 ===
     final_report: str
 
+    # 🔥 [新增] 违规统计数据 (用于存入 report_sessions 供 Dashboard 聚合)
+    violation_stats: Dict[str, int]
+
     # === 8. 系统控制字段 ===
     error: str
     current_step: str

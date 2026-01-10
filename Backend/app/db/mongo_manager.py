@@ -406,6 +406,44 @@ class MongoManager:
             self.db["report_sessions"].find().sort("created_at", -1).limit(limit)
         )
 
+    # ------------------------------------------------------------------
+    # 🔥 新增：从 report_sessions 聚合全局违规统计
+    # ------------------------------------------------------------------
+    def get_dashboard_violation_stats(self) -> Dict[str, int]:
+        """
+        读取最新一条 report_sessions 中的违规统计（violation_stats 字段），仅返回最新报告的统计数据。
+        """
+        try:
+            cursor = (
+                self.db["report_sessions"]
+                .find()
+                .sort("created_at", DESCENDING)
+                .limit(1)
+            )
+            sessions = list(cursor)
+            if not sessions:
+                logger.info("📊 [MongoDB] 未找到 report_sessions，返回空统计")
+                return {}
+
+            latest = sessions[0]
+            stats = (
+                latest.get("violation_stats")
+                or latest.get("violation_category_counts")
+                or {}
+            )
+
+            if not isinstance(stats, dict):
+                logger.warning(
+                    "📊 [MongoDB] 最新 report_sessions 中的 violation_stats 非字典类型，返回空统计"
+                )
+                return {}
+
+            logger.info(f"📊 [MongoDB] 获取最新报告违规统计，覆盖 {len(stats)} 个类别")
+            return stats
+        except Exception as e:
+            logger.error(f"❌ [MongoDB] 读取最新报告违规统计失败: {e}")
+            return {}
+
 
 mongo_db = MongoManager()
 # comment_like_count

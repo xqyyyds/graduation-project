@@ -10,6 +10,9 @@ from app.core.logger import logger
 from app.core.schemas import PrefaceSection
 from app.core.prompts import AGENT_E_PREFACE_TEMPLATE
 
+# 工具：归一化违规类别文本，避免细微差异拆桶
+from app.agents.tools import normalize_category
+
 
 class AgentReport:
     """
@@ -26,7 +29,7 @@ class AgentReport:
         )
         # self.preface_parser = JsonOutputParser(pydantic_object=PrefaceSection) (已弃用)
 
-    def generate_full_report(self, state_data: Dict[str, Any]) -> Dict[str, str]:
+    def generate_full_report(self, state_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         生成报告全流程
         """
@@ -54,9 +57,42 @@ class AgentReport:
         audit_results = state_data.get("audit_results", [])
         trend_report = state_data.get("trend_forecast", {})
 
+        # 🔥 生成结构化违规统计（主贴 + 评论）供持久化与 API 使用
+        # 使其与附录表格（_assemble_markdown 中的 category_counts）保持一致：
+        # 优先使用 evidence_report.violated_categories（若存在且为 list），否则退化为逐条统计 violated_comments 中的 category。
+        violation_stats: Dict[str, int] = {}
+        total_violated_posts = 0
+        total_violated_comments = 0
+
+        for r in audit_results:
+            info = r.get("violation_info") or {}
+
+            # 统计主贴/评论的数量（用于 totals）
+            if info.get("is_post_violated"):
+                total_violated_posts += 1
+
+            violated_comments = info.get("violated_comments") or []
+            total_violated_comments += len(violated_comments)
+
+            # 优先使用 evidence_report.violated_categories
+            violated_cats = (info.get("evidence_report") or {}).get(
+                "violated_categories"
+            )
+            if isinstance(violated_cats, list) and violated_cats:
+                for cat_raw in violated_cats:
+                    if not cat_raw:
+                        continue
+                    cat = normalize_category(cat_raw)
+                    violation_stats[cat] = violation_stats.get(cat, 0) + 1
+            else:
+                # 回退：使用评论里的 category 字段逐条计数
+                for c in violated_comments:
+                    cat = normalize_category((c or {}).get("category") or "其他")
+                    violation_stats[cat] = violation_stats.get(cat, 0) + 1
+
         # 2. 生成前言 (更高密度的素材摘要：事件榜单 + 少量深读摘要)
         top_events_lines = []
-        for i, e in enumerate(core_events[:15]):
+        for i, e in enumerate(core_events):
             name = e.get("event_name") or e.get("topic") or "未知"
             heat = e.get("total_heat", 0)
             kws = e.get("related_keywords") or e.get("keywords") or []
@@ -101,20 +137,24 @@ class AgentReport:
                 violations.append(r)
 
         # 🔥 升级：生成更丰富的合规摘要，供 Agent E 写前言
+        # 初始化 cat_counts，确保即使无违规也有此变量
+        cat_counts = {}
+
         if not violations:
             audit_str = "本期未发现高风险违规内容，舆论场整体平稳。"
         else:
             # 统计违规类型
-            cat_counts = {}
             for v in violations:
                 info = v.get("violation_info", {})
                 # 统计主贴
                 if info.get("is_post_violated"):
-                    cat = info.get("category", "其他")
+                    cat_raw = info.get("category", "其他")
+                    cat = normalize_category(cat_raw)
                     cat_counts[cat] = cat_counts.get(cat, 0) + 1
                 # 统计评论
                 for c in info.get("violated_comments", []):
-                    cat = c.get("category", "其他")
+                    cat_raw = (c or {}).get("category", "其他")
+                    cat = normalize_category(cat_raw)
                     cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
             top_cats = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -144,6 +184,7 @@ class AgentReport:
             e_str=events_str,
             a_str=audit_str,
             t_str=trend_str,
+            category=state_data.get("category", "综合"),
         )
 
         # 二次兜底：强制覆盖 report_period，避免模型乱写年份
@@ -162,7 +203,14 @@ class AgentReport:
         md_filename = f"舆情研判_{category}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
         md_path = self._save_markdown(md_content, md_filename)
 
-        return {"markdown": md_content, "md_path": md_path}
+        # 🔥 返回违规统计数据，供下游写入 Session
+        return {
+            "markdown": md_content,
+            "md_path": md_path,
+            "violation_stats": violation_stats,
+            "total_violated_posts": total_violated_posts,
+            "total_violated_comments": total_violated_comments,
+        }
 
     def _generate_preface(
         self,
@@ -172,10 +220,12 @@ class AgentReport:
         e_str: str,
         a_str: str,
         t_str: str,
+        category: str = "综合",
     ) -> PrefaceSection:
         """调用 LLM 生成前言"""
         try:
             # 🔥 升级：使用 with_structured_output
+            category = category if category not in ["综合", "其他"] else "全部"
             structured_llm = self.llm.with_structured_output(PrefaceSection)
             prompt = ChatPromptTemplate.from_template(AGENT_E_PREFACE_TEMPLATE)
 
@@ -189,6 +239,7 @@ class AgentReport:
                     "events_summary": e_str,
                     "audit_summary": a_str,
                     "trend_forecast": t_str,
+                    "category": category,
                 }
             )
         except Exception as e:
@@ -239,24 +290,133 @@ class AgentReport:
         # 内嵌样式（使 Markdown 在各种渲染器中都有良好的表格显示效果）
         # ==============================================================================
         css_style = """<style>
-/* 内容安全审核报告样式 */
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.8; color: #333; max-width: 1200px; margin: 0 auto; padding: 32px; }
-h1 { font-size: 26px; font-weight: 700; color: #1a1a1a; text-align: center; margin: 24px 0; padding-bottom: 16px; border-bottom: 2px solid #2563eb; }
-h2 { font-size: 20px; font-weight: 600; color: #1a1a1a; margin: 40px 0 20px; padding: 10px 14px; background: #f0f7ff; border-left: 4px solid #2563eb; border-radius: 0 6px 6px 0; }
-h3 { font-size: 17px; font-weight: 600; color: #333; margin: 32px 0 16px; padding-bottom: 8px; border-bottom: 1px solid #e5e7eb; }
-h4 { font-size: 16px; font-weight: 600; color: #1f2937; margin: 28px 0 14px; }
-blockquote { background: #fafafa; border-left: 3px solid #ddd; padding: 14px 20px; margin: 16px 0; border-radius: 0 6px 6px 0; color: #555; }
-hr { border: none; border-top: 1px solid #e0e0e0; margin: 32px 0; }
-/* 表格 */
-table { width: 100%; border-collapse: collapse; margin: 16px 0 28px; font-size: 13px; border: 1px solid #d1d5db; }
-thead { background: #475569; }
-th { padding: 10px 12px; text-align: left; font-weight: 600; font-size: 13px; color: #fff; border: 1px solid #475569; white-space: nowrap; }
-tbody tr:nth-child(odd) { background: #fff; }
-tbody tr:nth-child(even) { background: #f8fafc; }
-td { padding: 10px 12px; text-align: left; color: #374151; vertical-align: top; line-height: 1.5; border: 1px solid #e5e7eb; }
-strong { color: #1a1a1a; }
-em { color: #666; }
-@media print { body { padding: 16px; font-size: 12px; } table { page-break-inside: avoid; font-size: 11px; } th, td { padding: 6px 8px; } }
+* {
+    box-sizing: border-box;
+}
+/* 严格复刻前端 ReportDetail.vue 样式 (已针对下载优化) */
+body { 
+    font-family: "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+    font-size: 15px; 
+    line-height: 1.8; 
+    color: #374151; 
+    max-width: 2000px; 
+    margin: 0 auto !important; /* 强制居中 */
+    padding: 20px;
+    box-sizing: border-box;
+    width: 100% !important; /* 确保宽度100% */
+}
+
+/* 标题样式 */
+h1 { font-size: 24px; font-weight: 700; color: #111827; margin: 32px 0 20px; padding-bottom: 12px; border-bottom: 2px solid #2563eb; text-align: center; }
+h2 { font-size: 20px; font-weight: 600; color: #1f2937; margin: 36px 0 18px; padding: 10px 14px; background: #f0f7ff; border-left: 4px solid #2563eb; border-radius: 0 6px 6px 0; line-height: 1.4; }
+h3 { font-size: 17px; font-weight: 600; color: #374151; margin: 28px 0 14px; padding-bottom: 8px; border-bottom: 1px solid #e5e7eb; line-height: 1.4; }
+h4 { font-size: 16px; font-weight: 600; color: #1f2937; margin: 32px 0 16px; padding: 8px 12px; background: #f8fafc; border-radius: 6px; line-height: 1.4; }
+h5, h6 { font-size: 14px; font-weight: 600; color: #6b7280; margin: 16px 0 8px; line-height: 1.4; }
+
+/* 正文与排版 */
+p { margin: 12px 0; text-align: justify; }
+ul, ol { margin: 12px 0; padding-left: 24px; }
+li { margin: 8px 0; }
+
+/* 引用块 */
+blockquote { margin: 16px 0; padding: 12px 20px; background: #f9fafb; border-radius: 8px; color: #4b5563; }
+blockquote h2, blockquote h5 { border-left: none; padding-left: 0; }
+
+/* 强调与代码 */
+strong { color: #111827; font-weight: 600; }
+em { color: #6b7280; font-style: italic; }
+code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 14px; }
+pre { background: #1f2937; color: #f9fafb; padding: 16px; border-radius: 8px; overflow-x: auto; }
+pre code { background: transparent; padding: 0; }
+
+/* -------------------------------------------------------
+   【修复】消除表格横向滚动条，强制文字换行
+   ------------------------------------------------------- */
+table {
+    width: 100% !important;
+    table-layout: fixed; /* 关键：强制表格遵循列宽定义，而不是被内容撑开 */
+    border-collapse: collapse;
+}
+
+td, th {
+    word-wrap: break-word; /* 允许长单词换行 */
+    word-break: break-all; /* 强制在任意字符间换行（针对长英文或URL） */
+    white-space: normal !important; /* 强制允许换行 */
+    overflow-wrap: break-word;
+    vertical-align: top; /* 内容对齐到顶部，视觉更整齐 */
+}
+
+/* 针对主要的大表（违规数据监测）做针对性优化 */
+table:nth-of-type(n+6) {
+    display: table !important; /* 防止被变成 block 导致宽度失效 */
+}
+
+table:nth-of-type(1) th:nth-child(1) { width: 15%; }
+table:nth-of-type(1) th:nth-child(2) { width: 15%; }
+table:nth-of-type(1) th:nth-child(3) { width: 50%; }
+/* table:nth-of-type(1) th:nth-child(2) { 留空，自动填满 } */
+
+
+table:nth-of-type(2) th:nth-child(1) { width: 50%; }
+
+
+table:nth-of-type(3) th:nth-child(1) { width: 70%; }
+
+table:nth-of-type(4) th:nth-child(1) { width: 70%; }
+table:nth-of-type(4) th:nth-child(2) { width: 15%; }
+
+table:nth-of-type(5) th:nth-child(1) { width: 70%; }
+
+
+table:nth-of-type(n+6) th:nth-child(1) { width: 6%; }  /* 序号 */
+table:nth-of-type(n+6) th:nth-child(2) { width: 10%; } /* 风险等级 */
+/* table:nth-of-type(n+4) th:nth-child(3) { 违规内容 - 留空，它会吃掉所有剩余空间！ } */
+table:nth-of-type(n+6) th:nth-child(4) { width: 22%; } /* 判定理由 */
+table:nth-of-type(n+6) th:nth-child(5) { width: 20%; } /* 违反条款 */
+table:nth-of-type(n+6) th:nth-child(6) { width: 15%; } /* 处置建议 */
+
+
+/* 对齐微调 */
+table:nth-of-type(n+6) td:nth-child(1),
+table:nth-of-type(n+6) td:nth-child(2) { text-align: center !important; }
+
+table:nth-of-type(n+6) td:nth-child(3),
+table:nth-of-type(n+6) td:nth-child(4),
+table:nth-of-type(n+6) td:nth-child(5),
+table:nth-of-type(n+6) td:nth-child(6) { text-align: left !important; }
+
+
+/* -------------------------------------------------------
+   【修复】强制展开被折叠的内容
+   ------------------------------------------------------- */
+.truncated-cell { 
+    cursor: auto; 
+    max-height: none !important;
+    overflow: visible !important;
+}
+.truncated-cell::after { display: none !important; }
+.truncated-cell:hover { background: inherit !important; }
+
+/* 链接与分割线 */
+a { color: #2563eb; text-decoration: none; border-bottom: 1px solid transparent; transition: border-color 0.2s; }
+a:hover { border-bottom-color: #2563eb; }
+hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
+
+/* 打印优化 */
+@media print { 
+    body { 
+        padding: 0 !important; 
+        max-width: 100% !important; 
+        margin: 0 auto !important;
+        width: 100% !important;
+    } 
+    h2 { background: none; border: 1px solid #e5e7eb; } 
+    table { 
+        page-break-inside: auto;
+        width: 100% !important;
+    }
+    tr { page-break-inside: avoid; }
+}
 </style>
 
 """
@@ -264,7 +424,7 @@ em { color: #666; }
         # ==============================================================================
         # 1. 封面与前言 (Cover & Preface)
         # ==============================================================================
-        title_suffix = f"（{category}）" if category and category != "综合" else ""
+        title_suffix = f"（{category}）" 
         md = css_style
         md += f"# 内容安全审核与分析报告{title_suffix}\n\n"
         md += f"**报告日期**：{date_str}\n\n"
@@ -284,7 +444,7 @@ em { color: #666; }
             # 移除可能重复的 "其一，" 前缀
             clean_text = char_text.replace(f"{label}，", "").replace(f"{label}：", "")
             # 🔥 改为段落式，而非列表
-            md += f"**{label}，{clean_text}**\n\n"
+            md += f"{label}，{clean_text}\n\n"
         md += "\n"
 
         # (3) 违规透视
@@ -493,13 +653,14 @@ em { color: #666; }
                 "violated_categories"
             )
             if isinstance(violated_cats, list) and violated_cats:
-                for cat in violated_cats:
-                    if not cat:
+                for cat_raw in violated_cats:
+                    if not cat_raw:
                         continue
+                    cat = normalize_category(cat_raw)
                     category_counts[cat] = category_counts.get(cat, 0) + 1
             else:
                 for it in violated_comments:
-                    cat = (it or {}).get("category") or "其他"
+                    cat = normalize_category((it or {}).get("category") or "其他")
                     category_counts[cat] = category_counts.get(cat, 0) + 1
 
             # 条款引用统计：强制使用检索到的数据库 metadata (matched_laws)，不使用 LLM 生成的 evidence_report.cited_laws
@@ -514,7 +675,7 @@ em { color: #666; }
                 s = _esc_cell(suggestion)
                 suggestion_counts[s] = suggestion_counts.get(s, 0) + 1
 
-        md += f"本期共检出疑似违规帖子 **{total_posts}** 条，涉及违规评论 **{total_violated_comments}** 条。\n\n"
+        md += f"本期共检出疑似违规帖子 <strong>{total_posts}</strong> 条，涉及违规评论 <strong>{total_violated_comments}</strong> 条。\n\n"
 
         # --- 违规态势总结 ---
         md += "### 违规态势概述\n\n"
@@ -525,16 +686,14 @@ em { color: #666; }
         low_cnt = risk_counts.get("Low", 0)
 
         if high_cnt > 0:
-            risk_summary = (
-                f"本期违规内容中，**高风险(High)**占 {high_cnt} 条，需重点关注处置；"
-            )
+            risk_summary = f"本期违规内容中, <strong>高风险(High)</strong>占 {high_cnt} 条，需重点关注处置；"
         else:
             risk_summary = "本期未检出高风险(High)级别违规内容；"
 
         if medium_cnt > 0:
-            risk_summary += f"**中风险(Medium)**占 {medium_cnt} 条；"
+            risk_summary += f"<strong>中风险(Medium)</strong>占 {medium_cnt} 条；"
         if low_cnt > 0:
-            risk_summary += f"**低风险(Low)**占 {low_cnt} 条。"
+            risk_summary += f"<strong>低风险(Low)</strong>占 {low_cnt} 条。"
 
         md += f"{risk_summary}\n\n"
 
@@ -545,22 +704,12 @@ em { color: #666; }
             )[:3]
             cat_analysis = (
                 "从违规类型分布来看，主要集中在："
-                + "、".join([f"**{cat}**({cnt}次)" for cat, cnt in top3_cats])
+                + "、".join(
+                    [f"<strong>{cat}</strong>({cnt}次)" for cat, cnt in top3_cats]
+                )
                 + "。"
             )
             md += f"{cat_analysis}\n\n"
-
-        # 主要涉事事件分析
-        if event_post_counts:
-            top3_events = sorted(
-                event_post_counts.items(), key=lambda x: x[1], reverse=True
-            )[:3]
-            event_analysis = (
-                "违规内容主要涉及以下事件："
-                + "、".join([f"**{ename}**({cnt}条)" for ename, cnt in top3_events])
-                + "。"
-            )
-            md += f"{event_analysis}\n\n"
 
         md += "---\n\n"
 
@@ -652,25 +801,20 @@ em { color: #666; }
 
                 violated_comment_originals = v.get("violated_comment_originals", [])
                 seen_comments = set()
-                comment_count = 0
+
                 if violated_comment_originals:
                     for vc in violated_comment_originals:
                         content = vc.get("content", "")
-                        if (
-                            content
-                            and content not in seen_comments
-                            and comment_count < 2
-                        ):
+
+                        # 🔥🔥🔥【修改】完全去掉数量限制和长度截断 🔥🔥🔥
+                        if content and content not in seen_comments:
                             seen_comments.add(content)
-                            comment_count += 1
-                            truncated = content.strip()[:50]
-                            if len(content.strip()) > 50:
-                                truncated += "..."
-                            violation_text_parts.append(f"【评】{_esc_cell(truncated)}")
-                    if len(violated_comment_originals) > 2:
-                        violation_text_parts.append(
-                            f"...等{len(violated_comment_originals)}条"
-                        )
+
+                            # 直接使用 content.strip()，不再使用 [:50] 截断
+                            # 也不再检查 comment_count 计数器
+                            violation_text_parts.append(
+                                f"【评】{_esc_cell(content.strip())}"
+                            )
 
                 violation_cell = (
                     "<br>".join(violation_text_parts) if violation_text_parts else "-"
@@ -696,15 +840,14 @@ em { color: #666; }
                     behavior = law.get("full_desc", "")
                     text = f"《《微博社区公约》》{art}：{cat}\n{behavior}".strip()
                     law_parts.append(text)
-                law_cell = _esc_cell("、".join(law_parts)) if law_parts else "-"
+                # 使用换行符分隔多个条款，_esc_cell 会把换行替换成 <br>，确保表格中逐条换行显示
+                law_cell = _esc_cell("\n".join(law_parts)) if law_parts else "-"
 
-                # 处置建议
+                # 处置建议（不截断，保留完整文本）
                 suggestion = evidence_report.get("disposal_suggestion")
                 if suggestion:
-                    suggestion_cell = suggestion.strip()[:40]
-                    if len(suggestion.strip()) > 40:
-                        suggestion_cell += "..."
-                    suggestion_cell = _esc_cell(suggestion_cell)
+                    # 直接转义并保留完整建议内容，避免信息丢失
+                    suggestion_cell = _esc_cell(suggestion.strip())
                 else:
                     suggestion_cell = "-"
 

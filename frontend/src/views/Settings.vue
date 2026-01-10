@@ -528,7 +528,7 @@ onMounted(() => {
   font-size: 14px;
   line-height: 1.6;
   max-width: 90%;
-  margin-bottom: 32px;
+  margin: 0 auto 32px auto;
 }
 
 .tech-badges {

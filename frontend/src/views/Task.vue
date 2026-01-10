@@ -229,6 +229,7 @@
 </template>
 
 <script setup>
+import { storeToRefs } from "pinia";
 import { ref, computed, reactive, onMounted, onUnmounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useAppStore } from "../stores/app";
@@ -242,24 +243,39 @@ const isSubmitting = ref(false);
 
 const categories = computed(() => store.categories);
 const forecastRanges = computed(() => store.forecastRanges);
-const currentTask = computed(() => store.currentTask);
+// 直接使用 store 中的 ref，这样在脚本中访问时可以用 currentTask.value 获取真实对象
+const { currentTask, taskStartTime } = storeToRefs(store);
 const isTaskRunning = computed(() => store.isTaskRunning);
 
-// 计时器逻辑
-const startTime = ref(Date.now());
+// ==========================================
+// 🔥🔥🔥 核心修改：计时器逻辑彻底修复 🔥🔥🔥
+// ==========================================
 const elapsedTime = ref(0);
 let timerInterval = null;
 
+// 更新时间的核心函数
+const updateElapsedTime = () => {
+  // 🔥🔥🔥 修复重点 2：直接使用解构出来的 Ref (taskStartTime.value) 🔥🔥🔥
+  // 之前 store.taskStartTime.value 会因为自动解包变成 undefined
+  if (taskStartTime.value > 0 && currentTask.value) {
+    const now = Date.now();
+    elapsedTime.value = now - taskStartTime.value;
+  } else {
+    elapsedTime.value = 0;
+  }
+};
+
 const startTimer = () => {
-  startTime.value = Date.now();
   if (timerInterval) clearInterval(timerInterval);
-  timerInterval = setInterval(() => {
-    elapsedTime.value = Date.now() - startTime.value;
-  }, 1000);
+  updateElapsedTime(); // 立即执行一次，防止UI跳变
+  timerInterval = setInterval(updateElapsedTime, 1000);
 };
 
 const stopTimer = () => {
-  if (timerInterval) clearInterval(timerInterval);
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
 };
 
 // 监听任务状态自动启停计时器
@@ -267,20 +283,27 @@ watch(
   () => currentTask.value?.status,
   (newStatus) => {
     if (newStatus === "running") {
-      if (!timerInterval) startTimer(); // 避免重复启动
+      // 只要状态是运行中，就开启计时（updateElapsedTime 会自动去 store 拿正确的时间戳）
+      startTimer();
     } else if (newStatus === "completed" || newStatus === "failed") {
       stopTimer();
+      updateElapsedTime(); // 结束时最后校准一次时间
     } else {
-      elapsedTime.value = 0;
       stopTimer();
+      elapsedTime.value = 0;
     }
   },
-  { immediate: true }
+  { immediate: true } // 立即执行，确保刷新页面后能从 localStorage 恢复计时
 );
 
 onUnmounted(() => stopTimer());
 
+// ==========================================
+// 下面是常规业务逻辑，无需修改
+// ==========================================
+
 const formatDuration = (ms) => {
+  if (ms < 0) ms = 0;
   const totalSeconds = Math.floor(ms / 1000);
   const h = Math.floor(totalSeconds / 3600);
   const m = Math.floor((totalSeconds % 3600) / 60);
@@ -288,10 +311,6 @@ const formatDuration = (ms) => {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(
     s
   ).padStart(2, "0")}`;
-};
-
-const formatTime = (ts) => {
-  return new Date(ts).toLocaleTimeString("en-US", { hour12: false });
 };
 
 const taskForm = reactive({
@@ -346,34 +365,11 @@ const rules = {
   ],
 };
 
-const dateShortcuts = [
-  {
-    text: "最近一周",
-    value: () => {
-      const end = new Date();
-      const start = new Date();
-      start.setTime(start.getTime() - 3600 * 1000 * 24 * 7);
-      return [start, end];
-    },
-  },
-  {
-    text: "最近一个月",
-    value: () => {
-      const end = new Date();
-      const start = new Date();
-      start.setTime(start.getTime() - 3600 * 1000 * 24 * 30);
-      return [start, end];
-    },
-  },
-];
-
 const submitTask = async () => {
   if (!formRef.value) return;
   await formRef.value.validate(async (valid) => {
     if (valid) {
       isSubmitting.value = true;
-      elapsedTime.value = 0; // 重置计时
-      startTimer(); // 立即启动视觉计时
       try {
         await store.createTask({
           category: taskForm.category,
@@ -384,7 +380,6 @@ const submitTask = async () => {
         ElMessage.success("指令已下发，任务开始执行");
       } catch (e) {
         ElMessage.error("启动失败: " + e.message);
-        stopTimer();
       } finally {
         isSubmitting.value = false;
       }
@@ -417,7 +412,7 @@ const isStepCompleted = (step) => {
 
 const viewReport = () => router.push("/reports");
 const resetTask = () => {
-  store.clearCurrentTask();
+  store.clearCurrentTask(); // 这会同时重置 store.taskStartTime
   elapsedTime.value = 0;
   stopTimer();
 };

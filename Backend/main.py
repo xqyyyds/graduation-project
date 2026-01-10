@@ -146,6 +146,24 @@ def run_task(
                     if node_name in node_progress_map:
                         prog, step, msg = node_progress_map[node_name]
                         report_progress(prog, step, f"{step}完成")
+
+                        # 立即将下一个节点标记为“处理中”（若存在），避免前端显示延后一拍
+                        try:
+                            node_keys = list(node_progress_map.keys())
+                            idx = node_keys.index(node_name)
+                            if idx + 1 < len(node_keys):
+                                next_name = node_keys[idx + 1]
+                                next_prog, next_step, _ = node_progress_map[next_name]
+                                # 保持进度递增且不跳跃过大：取 min(next_prog-1, prog+1)
+                                processing_prog = min(next_prog - 1, prog + 1)
+                                report_progress(
+                                    processing_prog,
+                                    next_step,
+                                    f"{next_step}处理中...",
+                                )
+                        except Exception:
+                            # 忽略任何边界或索引错误，正常运行即可
+                            pass
                     else:
                         # 尝试从 state_delta 获取步骤信息
                         current_step = state_delta.get("current_step", "处理中")

@@ -235,6 +235,9 @@ def agent_b_node(state: GraphState) -> Dict[str, Any]:
                     ],
                     "media_context": media_context,
                     "audit_status": p.get("audit_status"),
+                    # 🔥🔥🔥 【新增】保留数据库已有的审核结果 🔥🔥🔥
+                    "is_violation": p.get("is_violation"),
+                    "violation_info": p.get("violation_info"),
                 }
                 valid_posts_data.append(post_packet)
 
@@ -411,9 +414,25 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     def process_single_audit_task(p, event_name):
         try:
-            # 🔥 如果配置了强制重新审核，或者状态不是 completed，才进行审核
+            # 🔥🔥🔥 【修改】处理已审核过的帖子 🔥🔥🔥
             if not settings.FORCE_AUDIT_UPDATE and p.get("audit_status") == "completed":
-                return None
+                # 如果数据库里已经是违规状态，我们需要把它加回本次报告中
+                if p.get("is_violation") is True:
+                    existing_info = p.get("violation_info") or {}
+                    # 构造与新审核一致的返回结构
+                    return {
+                        "post": p,
+                        "event_name": event_name,
+                        "is_violation": True,
+                        "violation_info": existing_info,
+                        "comment_items": p.get("comment_items", []),
+                        # 注意：这里需要确保 p 里有 comment_items，或者从 p['comments'] 还原
+                        # 如果 existing_info 里有 violated_comments，报告生成器就能用
+                        "violated_comments": existing_info.get("violated_comments", []),
+                    }
+                else:
+                    # 既已完成又是安全的，则本次报告直接忽略
+                    return None
 
             # 这里的 comments 是全量 200 条（同时保留评论 _id 用于回写）
             comment_items = p.get("comment_items") or []
@@ -612,6 +631,7 @@ def agent_d_node(state: GraphState) -> Dict[str, Any]:
     logger.info("\n🔮 [Node D] 启动：趋势研判...")
     analyzed_events = state.get("analyzed_events", [])
     audit_results = state.get("audit_results", [])
+    category = state.get("category") or "综合"  # 新增对于类别准确预测
 
     b_texts = []
     for evt in analyzed_events:
@@ -643,7 +663,6 @@ def agent_d_node(state: GraphState) -> Dict[str, Any]:
     # 0. 获取用户指定的预测范围 (从 state 读取)
     forecast_range = state.get("forecast_range") or "1m"
 
-    # 解析预测范围，计算目标时间
     range_map = {
         "1w": (7, "days"),
         "2w": (14, "days"),
@@ -651,43 +670,87 @@ def agent_d_node(state: GraphState) -> Dict[str, Any]:
         "2m": (2, "months"),
     }
     delta_val, delta_unit = range_map.get(forecast_range, (1, "months"))
-
-    # 1. 锁定时间坐标
     now = datetime.now()
-    if delta_unit == "days":
-        target_date = now + timedelta(days=delta_val)
+
+    # 🔥 定义领域限定词 (关键修改)
+    if category in ["综合", "其他"] or not category:
+        domain_kw = ""  # 通用搜索
+        domain_desc = "全网"
     else:
+        domain_kw = f"{category}领域"  # 例如：高校领域、科技领域
+        domain_desc = f"{category}行业"
+
+    if delta_unit == "days":
+        # ==========================================
+        # 🟢 场景 A：短期预测 (未来 1-2 周)
+        # ==========================================
+        # 1. 锁定具体日期区间（从今天到未来 N 天）
+        end_date = now + timedelta(days=delta_val)
+        time_period_desc = f"{now.strftime('%Y年%m月%d日')}至{end_date.strftime('%Y年%m月%d日')}（未来{delta_val}天）"
+
+        # 2. 计算“旬”以精确匹配历史规律（保留原有旬判断供参考）
+        day_num = now.day
+        if day_num <= 10:
+            period_mark = "上旬"
+        elif day_num <= 20:
+            period_mark = "中旬"
+        else:
+            period_mark = "下旬"
+
+        # 3. 搜历史：使用明确的日期区间作为匹配条件，便于检索历年同期案例（包含 domain_kw）
+        query_history = (
+            f"历年{now.month}月{now.day}日~{end_date.month}月{end_date.day}日 中国{domain_kw}重点、热门网络舆情 高发事件 复盘 "
+            f"历年{now.month}月{now.day}日~{end_date.month}月{end_date.day}日 {domain_kw}典型舆情案例"
+        )
+
+        # 4. 搜未来：明确描述未来时间段与领域，聚焦未来N天内的政策/日历与风险前瞻
+        query_future = (
+            f"{now.year}年{now.month}月{now.day}日 至 {end_date.year}年{end_date.month}月{end_date.day}日 {domain_kw}重点新闻日历 大事预告 "
+            f"未来{delta_val}天 中国{domain_kw}舆情 风险点前瞻"
+        )
+
+    else:
+        # ==========================================
+        # 🔵 场景 B：中长期预测 (未来 1-2 个月)
+        # ==========================================
+        # 1. 锁定目标结束日期（从今天到未来N个月的同一日期）
         target_date = now + relativedelta(months=delta_val)
+        target_year = target_date.year
+        target_month = target_date.month
 
-    target_year = target_date.year
-    target_month = target_date.month
+        time_period_desc = f"{now.strftime('%Y年%m月%d日')}至{target_date.strftime('%Y年%m月%d日')}（未来{delta_val}个月）"
 
+        # 2. 搜历史：使用跨月/跨日的日期区间，检索历年同期案例（包含 domain_kw）
+        query_history = (
+            f"历年{now.month}月{now.day}日~{target_date.month}月{target_date.day}日 中国{domain_kw}重点、热门网络舆情 高发领域 复盘 "
+            f"历年{now.month}月{now.day}日~{target_date.month}月{target_date.day}日 {domain_kw}典型舆情案例"
+        )
+
+        # 3. 搜未来：强调未来数月内的日历事件与趋势预测
+        query_future = (
+            f"未来{delta_val}个月 中国{domain_kw}重点新闻日历 大事预告 "
+            f"未来{delta_val}个月 中国{domain_kw}舆情 风险点前瞻 "
+            f"{target_year}年{target_month}月 {domain_kw}政策施行 发展趋势前瞻"
+        )
     logger.info(
-        f"   🌍 [Node D] 正在调取全网情报库 (目标: {target_year}年{target_month}月, 范围: {forecast_range})..."
+        f"   🌍 [Node D] 正在调取全网{domain_desc}情报库 (研判周期: {time_period_desc})..."
     )
 
-    # 2. 搜历史铁律
-    query_history = (
-        f"历年{target_month}月 中国网络舆情 高发领域 复盘 "
-        f"历年{target_month}月 社会矛盾 典型舆情案例"
-    )
-    # 3. 搜未来前瞻
-    query_future = (
-        f"{target_year}年{target_month}月 中国 社会舆情风险点 专家预测 "
-        f"{target_year}年{target_month}月 舆情研判 重点关注领域 "
-        f"{target_year}年{target_month}月 政策施行 经济形势 民生痛点前瞻"
-    )
+    # --- 优化结束 ---
 
+    # 执行搜索
     history_context = get_web_context(query_history)
     future_context = get_web_context(query_future)
 
-    # 4. 调用 Agent D 进行研判 (传递 forecast_range)
+    # 4. 调用 Agent D (必须传递 time_period_desc)
     forecast = agent_forecast.run(
         current_opinion_analysis=opinion_str,
         audit_risks=audit_str,
         history_context=history_context,
         future_context=future_context,
         forecast_range=forecast_range,
+        time_period_desc=time_period_desc,  # 🔥 关键：告诉 LLM 它到底在预测哪几天
+        category=category,  # 新增对于类别准确预测
     )
     return {"trend_forecast": forecast, "current_step": "D_Done"}
 
@@ -707,10 +770,12 @@ def agent_e_node(state: GraphState) -> Dict[str, Any]:
         session_data = {
             "task_id": state.get("task_id"),
             "created_at": datetime.now(),
+            "category": state.get("category", "综合"),
             "pdf_path": output.get("pdf_path", ""),
             "report_markdown": output.get("markdown", ""),
             "trend_forecast": state.get("trend_forecast", {}),
-            "core_events": state.get("core_events", [])[:20],  # 仅保留 Top20 简要元数据
+            "core_events": state.get("core_events", []),
+            "violation_stats": output.get("violation_stats", {}),
         }
         mongo_db.save_report_session(session_data)
         logger.info("💾 [Memory] 报告已存入长期记忆 (report_sessions)")

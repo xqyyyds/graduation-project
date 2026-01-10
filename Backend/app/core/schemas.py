@@ -1,6 +1,8 @@
 # app/core/schemas.py
+from __future__ import annotations
+
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, conlist
 
 
 # =====================================================
@@ -218,20 +220,29 @@ class ComplianceEvidenceReport(BaseModel):
 
 
 # =====================================================
-# 5. Agent D: 舆情战略预警师
+# Agent D: 舆情战略预警师 (Schema Definition)
 # =====================================================
 
 
 class ForecastPoint(BaseModel):
-    """单个风险点或建议点"""
+    """单个风险点详情"""
 
     subtitle: str = Field(
         ...,
-        description="子标题，格式如：'（一）跨区域标准不一易引发争议' 或 '（二）警惕政策调整忽视从业者权益'。严禁使用Emoji。",
+        description="子标题，高度概括该风险点。格式如：'（一）跨区域执法标准不一易引发舆论争议'。严禁使用Emoji。",
     )
     content: str = Field(
         ...,
-        description="详细内容，必须不少于80字/4句话。必须包含：风险描述 + 触发条件/预警信号 + 可能演化路径 + 可落地的应对建议。严禁只写一句话概述。风格严肃专业，严禁使用Emoji。",
+        min_length=80,
+        description="【深度研判内容】必须包含三个要素：1.触发场景（未来什么具体事件或时间节点会触发此风险）；2.演化路径（舆情将如何从点扩散到面）；3.落地建议（具体的防范或应对措施）。禁止空泛的废话。",
+    )
+    likelihood: Literal["高", "中", "低"] = Field(
+        ..., description="该风险在预测周期内发生的概率评估。"
+    )
+    evidence_basis: List[str] = Field(
+        ...,
+        description="【预测依据】必须列出支撑该预测的逻辑来源。例如：['历史规律：往年3月均为高校心理危机高发期', '未来情报：预计XX新规将于下月实施']。禁止仅引用'当前舆论情绪'。",
+        min_length=1,
     )
 
 
@@ -240,25 +251,36 @@ class ForecastTopic(BaseModel):
 
     topic_name: str = Field(
         ...,
-        description="议题标题，采用动宾结构或对仗句式，如：'如何打好烟花爆竹管控攻坚战，考验政府治理能力' 或 '推动矛盾纠纷化解，维护基层社会和谐稳定'。严禁使用Emoji。",
+        description="议题标题，采用动宾结构或对仗句式，风格严肃。如：'如何打好...攻坚战' 或 '警惕...风险叠加'。",
     )
     background: str = Field(
         ...,
-        description="背景导语，必须不少于60字/3句话。简述该议题的宏观背景、时间节点特征（如节假日/政策窗口/国际局势），并说明为何本月该议题更敏感。风格严肃，严禁使用Emoji。",
+        description="【未来视角背景】简述下个周期（研判目标月）的特殊性（如：适逢开学季/政策窗口期/敏感纪念日/特定季节特征）。说明为何在该时间节点此议题会爆发。",
+        min_length=60,
     )
     points: List[ForecastPoint] = Field(
-        ..., description="该议题下的具体风险点列表（通常3-5点）。"
+        ...,
+        min_length=3,
+        max_length=5,
+        description="该议题下的具体风险演化点（3-5个）。",
     )
 
 
 class TrendForecastReport(BaseModel):
     """Agent D 的最终产出 (Government Report Style)"""
 
-    target_month: str = Field(..., description="研判的目标月份 (如: '2026年1月')")
+    target_period: str = Field(..., description="研判的周期与领域范围描述")
+
+    evidence_sources: List[str] = Field(
+        ...,
+        description="【参考文献/宏观依据】列出推演时参考的宏观依据来源，如：'教育部历年工作要点'、'国家统计局季节性数据'、'XX行业发展规划'等。",
+    )
 
     topics: List[ForecastTopic] = Field(
         ...,
-        description="【核心议题预测】列出 3-5 个下个月最需要关注的舆情风险议题。要求各议题维度互不重复、主题不相似(避免同义改写)。每个议题包含背景和若干具体风险点。",
+        min_length=3,
+        max_length=5,
+        description="【核心议题预测】列出 3-5 个下个月最需要关注的舆情风险议题。要求各议题维度互不重复（正交）。",
     )
 
 
@@ -276,7 +298,7 @@ class PrefaceSection(BaseModel):
 
     overview: str = Field(
         ...,
-        description="【开篇综述】必须不少于200字/2个自然段。概括本周期舆情的时间跨度、涉及领域（如民生/国际/社会事件）、总体态势，并提炼热点领域分布与主导情绪结构。严禁空泛套话，必须结合素材中的具体事件类型进行归纳。风格严肃，严禁使用Emoji。",
+        description="【开篇综述】必须不少于200字/2个自然段。概括本周期舆情的时间跨度、涉及领域（如社会/高校/生活/综合等提示词传递的领域）、总体态势，并提炼热点领域分布与主导情绪结构。严禁空泛套话，必须结合素材中的具体事件类型进行归纳。风格严肃，严禁使用Emoji。",
     )
 
     characteristics: List[str] = Field(

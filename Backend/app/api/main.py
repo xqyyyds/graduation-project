@@ -29,6 +29,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from main import run_task
 
+# 🔥 新增导入 mongo_db，用于获取违规统计
+from app.db.mongo_manager import mongo_db
+
 app = FastAPI(
     title="舆情研判系统 API",
     description="社交媒体舆情分析与研判报告生成系统",
@@ -160,6 +163,8 @@ class DashboardStats(BaseModel):
     reports_today: int
     reports_this_week: int
     category_distribution: dict
+    # 🔥 新增字段：违规统计分布
+    violation_distribution: dict
     recent_reports: List[ReportSummary]
 
 
@@ -311,8 +316,7 @@ async def get_dashboard_stats():
     reports = list_all_reports()
 
     today = datetime.now().strftime("%Y%m%d")
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-
+    
     reports_today = sum(1 for r in reports if today in r.filename)
     reports_this_week = sum(
         1
@@ -323,46 +327,23 @@ async def get_dashboard_stats():
         )
     )
 
-    # 统计分类分布
+    # 1. 统计分类分布 (饼图数据)
     category_dist = {}
     for r in reports:
         cat = r.category
         category_dist[cat] = category_dist.get(cat, 0) + 1
+
+    # 2. 🔥 调用 MongoDB 聚合查询获取违规统计 (条形图数据)
+    violation_dist = mongo_db.get_dashboard_violation_stats()
 
     return DashboardStats(
         total_reports=len(reports),
         reports_today=reports_today,
         reports_this_week=reports_this_week,
         category_distribution=category_dist,
+        violation_distribution=violation_dist, # 🔥 返回聚合结果
         recent_reports=reports[:10],  # 显示更多报告
     )
-
-
-@app.get("/api/dashboard/latest-report/violations")
-async def get_latest_report_violations():
-    """返回最新 report_session 中持久化的违规类别合计统计（直接复用 Agent E 计算结果）。
-    返回格式: { "category_counts": {cat: count}, "total_violated_posts": int, "total_violated_comments": int }
-    如果不存在结构化统计，返回 { "category_counts": {} }（不再做 MD 解析回退）。"""
-    try:
-        sessions = mongo_db.get_report_history(limit=1)
-        if sessions:
-            latest_session = sessions[0]
-            counts = latest_session.get("violation_category_counts")
-            if isinstance(counts, dict):
-                return {
-                    "category_counts": counts,
-                    "total_violated_posts": latest_session.get(
-                        "total_violated_posts", 0
-                    ),
-                    "total_violated_comments": latest_session.get(
-                        "total_violated_comments", 0
-                    ),
-                }
-    except Exception as e:
-        add_system_log("ERROR", f"读取 report_sessions 失败: {e}")
-
-    # 未找到结构化统计，按要求不再回退解析 Markdown，直接返回空对象
-    return {"category_counts": {}}
 
 
 @app.post("/api/tasks", response_model=TaskStatus)

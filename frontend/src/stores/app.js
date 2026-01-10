@@ -24,11 +24,15 @@ export const useAppStore = defineStore("app", () => {
   // ==========================================
   // 1. 核心状态 (State)
   // ==========================================
-  const sidebarCollapsed = ref(loadState("sidebarCollapsed", false)); 
-  const currentTask = ref(loadState("currentTask", null));            
-  const taskPollingInterval = ref(null);                              
+  const sidebarCollapsed = ref(loadState("sidebarCollapsed", false));
+  const currentTask = ref(loadState("currentTask", null));
+  
+  // 🔥🔥🔥 核心修改：将计时起始时间独立存储，不依赖 API 返回的对象 🔥🔥🔥
+  const taskStartTime = ref(loadState("taskStartTime", 0)); 
+  
+  const taskPollingInterval = ref(null);
 
-  // 🔥 新增：主题配置状态
+  // 主题配置状态
   const themeConfig = ref(loadState("themeConfig", {
     primaryColor: "#3b82f6", // 默认主题色
     isDark: false,           // 默认浅色模式
@@ -48,8 +52,8 @@ export const useAppStore = defineStore("app", () => {
     total_reports: 0,
     reports_today: 0,
     reports_this_week: 0,
-    category_distribution: {}, 
-    recent_reports: [],        
+    category_distribution: {},
+    recent_reports: [],
   });
 
   // 报告列表数据
@@ -73,8 +77,10 @@ export const useAppStore = defineStore("app", () => {
   watch(sidebarCollapsed, (val) => saveState("sidebarCollapsed", val));
   watch(currentTask, (val) => saveState("currentTask", val), { deep: true });
   watch(settings, (val) => saveState("appSettings", val), { deep: true });
-  // 🔥 监听主题变化并自动保存
   watch(themeConfig, (val) => saveState("themeConfig", val), { deep: true });
+  
+  // 🔥 新增：单独监听并持久化开始时间，确保刷新页面时间不丢失
+  watch(taskStartTime, (val) => saveState("taskStartTime", val));
 
   // ==========================================
   // 4. 业务动作 (Actions)
@@ -84,12 +90,10 @@ export const useAppStore = defineStore("app", () => {
     sidebarCollapsed.value = !sidebarCollapsed.value;
   };
 
-  // 🔥 切换主题色
   const setThemeColor = (color) => {
     themeConfig.value.primaryColor = color;
   };
 
-  // 🔥 切换暗黑模式
   const toggleDarkMode = (isDark) => {
     themeConfig.value.isDark = isDark;
   };
@@ -118,8 +122,16 @@ export const useAppStore = defineStore("app", () => {
 
   const createTask = async (params) => {
     try {
+      // 1. 先调用 API
       const data = await api.createTask(params);
+      
+      // 2. 🔥 成功后，立即记录当前时间为开始时间
+      taskStartTime.value = Date.now();
+      
+      // 3. 更新任务状态
       currentTask.value = data;
+      
+      // 4. 开始轮询
       startTaskPolling(data.task_id);
       return data;
     } catch (error) {
@@ -132,7 +144,9 @@ export const useAppStore = defineStore("app", () => {
     if (taskPollingInterval.value) {
       clearInterval(taskPollingInterval.value);
     }
+    // 立即查一次
     fetchTaskStatus(taskId);
+    // 开启轮询
     taskPollingInterval.value = setInterval(async () => {
       await fetchTaskStatus(taskId);
     }, 2000);
@@ -141,12 +155,15 @@ export const useAppStore = defineStore("app", () => {
   const fetchTaskStatus = async (taskId) => {
     try {
       const status = await api.getTaskStatus(taskId);
+      
+      // 🔥 修改：直接覆盖 currentTask，不需要手动处理时间戳
+      // 因为时间戳现在存在 taskStartTime 变量里，这里怎么覆盖都安全
       currentTask.value = status;
 
       if (status.status === "completed" || status.status === "failed") {
         stopTaskPolling();
-        await fetchDashboardStats(); 
-        await fetchReports();        
+        await fetchDashboardStats();
+        await fetchReports();
       }
     } catch (error) {
       console.error("轮询状态失败:", error);
@@ -179,18 +196,20 @@ export const useAppStore = defineStore("app", () => {
   const clearCurrentTask = () => {
     stopTaskPolling();
     currentTask.value = null;
+    taskStartTime.value = 0; // 🔥 任务重置时，清空时间
   };
 
   return {
     sidebarCollapsed,
     currentTask,
+    taskStartTime, // 🔥 记得导出这个变量给组件使用
     dashboardStats,
     reports,
     selectedCategory,
     categories,
     forecastRanges,
     settings,
-    themeConfig, // 🔥 导出主题配置
+    themeConfig,
     isTaskRunning: computed(() => currentTask.value?.status === "running"),
     toggleSidebar,
     updateSettings,
@@ -201,7 +220,7 @@ export const useAppStore = defineStore("app", () => {
     stopTaskPolling,
     restoreTaskPolling,
     clearCurrentTask,
-    setThemeColor, // 🔥 导出设置颜色方法
-    toggleDarkMode // 🔥 导出设置暗黑方法
+    setThemeColor,
+    toggleDarkMode
   };
 });
