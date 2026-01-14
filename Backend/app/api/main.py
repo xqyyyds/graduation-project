@@ -144,6 +144,8 @@ class TaskStatus(BaseModel):
     progress: int  # 0-100
     current_step: str
     message: str
+    start_time: Optional[int] = None  # 毫秒时间戳
+    end_time: Optional[int] = None  # 毫秒时间戳（任务完成或失败时写入）
 
 
 class ReportSummary(BaseModel):
@@ -176,14 +178,18 @@ task_store = {}
 
 
 def update_task_progress(task_id: str, progress: int, step: str, message: str):
-    """更新任务进度（供外部调用）"""
+    """更新任务进度（供外部调用），保留已有 start_time/end_time 字段"""
     if task_id in task_store:
-        task_store[task_id] = {
-            "status": "running",
-            "progress": progress,
-            "current_step": step,
-            "message": message,
-        }
+        existing = dict(task_store.get(task_id, {}))
+        existing.update(
+            {
+                "status": "running",
+                "progress": progress,
+                "current_step": step,
+                "message": message,
+            }
+        )
+        task_store[task_id] = existing
 
 
 async def execute_task(task_id: str, params: TaskCreate):
@@ -194,17 +200,24 @@ async def execute_task(task_id: str, params: TaskCreate):
             "progress": 5,
             "current_step": "初始化",
             "message": "正在启动任务...",
+            # 记录任务启动时间（毫秒）用于前端计时与回放
+            "start_time": int(datetime.now().timestamp() * 1000),
         }
         add_system_log("INFO", f"🚀 任务 {task_id} 开始执行")
 
         # 定义进度回调函数
         def progress_callback(progress: int, step: str, message: str):
-            task_store[task_id] = {
-                "status": "running",
-                "progress": progress,
-                "current_step": step,
-                "message": message,
-            }
+            # 合并更新，保留 start_time/end_time 等元数据
+            existing = dict(task_store.get(task_id, {}))
+            existing.update(
+                {
+                    "status": "running",
+                    "progress": progress,
+                    "current_step": step,
+                    "message": message,
+                }
+            )
+            task_store[task_id] = existing
             # 同时记录到日志
             add_system_log("INFO", f"[{step}] {message} ({progress}%)")
 
@@ -221,20 +234,31 @@ async def execute_task(task_id: str, params: TaskCreate):
             progress_callback,  # 传递进度回调
         )
 
-        task_store[task_id] = {
-            "status": "completed",
-            "progress": 100,
-            "current_step": "完成",
-            "message": "报告生成成功",
-        }
+        # 合并更新，保留 start_time 等元数据，并写入 end_time
+        existing = dict(task_store.get(task_id, {}))
+        existing.update(
+            {
+                "status": "completed",
+                "progress": 100,
+                "current_step": "完成",
+                "message": "报告生成成功",
+                "end_time": int(datetime.now().timestamp() * 1000),
+            }
+        )
+        task_store[task_id] = existing
         add_system_log("INFO", f"✅ 任务 {task_id} 执行完成")
     except Exception as e:
-        task_store[task_id] = {
-            "status": "failed",
-            "progress": 0,
-            "current_step": "错误",
-            "message": str(e),
-        }
+        existing = dict(task_store.get(task_id, {}))
+        existing.update(
+            {
+                "status": "failed",
+                "progress": 0,
+                "current_step": "错误",
+                "message": str(e),
+                "end_time": int(datetime.now().timestamp() * 1000),
+            }
+        )
+        task_store[task_id] = existing
         add_system_log("ERROR", f"❌ 任务 {task_id} 执行失败: {str(e)}")
 
 
@@ -316,7 +340,7 @@ async def get_dashboard_stats():
     reports = list_all_reports()
 
     today = datetime.now().strftime("%Y%m%d")
-    
+
     reports_today = sum(1 for r in reports if today in r.filename)
     reports_this_week = sum(
         1
@@ -341,7 +365,7 @@ async def get_dashboard_stats():
         reports_today=reports_today,
         reports_this_week=reports_this_week,
         category_distribution=category_dist,
-        violation_distribution=violation_dist, # 🔥 返回聚合结果
+        violation_distribution=violation_dist,  # 🔥 返回聚合结果
         recent_reports=reports[:10],  # 显示更多报告
     )
 
@@ -356,11 +380,14 @@ async def create_task(params: TaskCreate, background_tasks: BackgroundTasks):
     # 添加后台任务
     background_tasks.add_task(execute_task, task_id, params)
 
+    start_ts = int(datetime.now().timestamp() * 1000)
     task_store[task_id] = {
         "status": "running",
         "progress": 0,
         "current_step": "初始化",
         "message": "任务已创建，正在排队...",
+        # 记录任务启动时间（毫秒）用于前端计时冻结
+        "start_time": start_ts,
     }
 
     return TaskStatus(
@@ -369,6 +396,7 @@ async def create_task(params: TaskCreate, background_tasks: BackgroundTasks):
         progress=0,
         current_step="初始化",
         message="任务已创建",
+        start_time=start_ts,
     )
 
 

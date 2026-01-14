@@ -268,7 +268,6 @@ class AgentCompliance:
 
         # 3) 生成证据链（结构化 JSON）
         try:
-            # 仍然尝试调用 LLM 生成 reasoning 与处置建议，但强制替换 cited_laws
             structured_llm = self.llm.with_structured_output(ComplianceEvidenceReport)
             prompt = ChatPromptTemplate.from_template(AGENT_C_EVIDENCE_TEMPLATE)
             chain = prompt | structured_llm
@@ -277,9 +276,7 @@ class AgentCompliance:
                 {
                     "post_content": post_content,
                     "media_context": media_context,
-                    "violated_items_json": json.dumps(
-                        violated_items, ensure_ascii=False
-                    ),
+                    "violated_items_json": json.dumps(violated_items, ensure_ascii=False),
                     "laws_json": json.dumps(matched_laws, ensure_ascii=False),
                 }
             )
@@ -292,12 +289,42 @@ class AgentCompliance:
             logger.warning(f"⚠️ [Agent C] 证据链生成失败 (ID: {note_id}): {e}")
             evidence_report = {}
 
+        # ======================================================================
+        # 🔥 Step 4: 兜底回填逻辑 (修复版)
+        # ======================================================================
+        # 严格映射 LLM 生成的 LawReference 字段，不使用硬编码默认值
+        if not matched_laws and evidence_report:
+            cited_list = evidence_report.get("cited_laws") or []
+            
+            for item in cited_list:
+                # item 已经是字典 (来自 evidence_report.model_dump())
+                
+                fallback_law = {
+                    # 1. 基础字段直接映射 (LLM 输出什么就用什么)
+                    "category": item.get("category"),   
+                    "article": item.get("article"),     
+                    "risk_level": item.get("risk_level"), 
+                    
+                    # 2. 内容字段映射
+                    # Chroma 结果里叫 "rule" (page_content)，Schema 里也叫 "rule"
+                    "rule": item.get("rule"),           
+                    
+                    # 3. 关键字段适配
+                    # agent_report.py 的 _assemble_markdown 方法读取的是 "full_desc"
+                    # LawReference Schema 里没有 full_desc，只有 rule
+                    # 所以必须把 rule 的内容填给 full_desc，否则报告表格里这一栏会是空白或"-"
+                    "full_desc": item.get("rule")       
+                }
+                matched_laws.append(fallback_law)
+                
+            if matched_laws:
+                logger.info(f"🔄 [Agent C] RAG为空，已回填 {len(matched_laws)} 条 LLM 生成的条款。")
+
         return {
             "batch_result": batch_dict,
             "matched_laws": matched_laws,
             "evidence_report": evidence_report,
         }
-
 
 # 单例导出
 agent_c = AgentCompliance()

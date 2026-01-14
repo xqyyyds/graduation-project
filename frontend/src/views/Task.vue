@@ -255,13 +255,29 @@ let timerInterval = null;
 
 // 更新时间的核心函数
 const updateElapsedTime = () => {
-  // 🔥🔥🔥 修复重点 2：直接使用解构出来的 Ref (taskStartTime.value) 🔥🔥🔥
-  // 之前 store.taskStartTime.value 会因为自动解包变成 undefined
-  if (taskStartTime.value > 0 && currentTask.value) {
-    const now = Date.now();
-    elapsedTime.value = now - taskStartTime.value;
-  } else {
+  // 优先使用后端返回的 start_time/end_time（毫秒），兜底使用本地的 taskStartTime
+  const start =
+    (currentTask.value && currentTask.value.start_time) ||
+    taskStartTime.value ||
+    0;
+  if (!start || start <= 0) {
     elapsedTime.value = 0;
+    return;
+  }
+
+  // 如果后端有结束时间且任务已完成/失败，使用结束时间冻结显示
+  const end = currentTask.value && currentTask.value.end_time;
+  if (
+    currentTask.value &&
+    (currentTask.value.status === "completed" ||
+      currentTask.value.status === "failed") &&
+    end &&
+    end > 0
+  ) {
+    elapsedTime.value = end - start;
+  } else {
+    const now = Date.now();
+    elapsedTime.value = now - start;
   }
 };
 
