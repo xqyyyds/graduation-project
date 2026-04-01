@@ -31,7 +31,7 @@ except ModuleNotFoundError:
 
     base = Path(__file__).resolve().parents[1]  # 指向 Backend/ 目录
     sys.path.insert(0, str(base))
-    print(f"ℹ️ 将 {base} 加入 Python 路径以导入项目包")
+    print(f"INFO: 将 {base} 加入 Python 路径以导入项目包")
     from app.core.config import settings
 
 
@@ -68,11 +68,11 @@ def _parse_args() -> argparse.Namespace:
         description="按 last_collected 删除指定日期或时间之后的文档（默认 dry-run）"
     )
     p.add_argument(
-        "date",
+        "--date",
         nargs="?",
-        default="2026-01-05 14:00",
+        default="2026-01-17 14:00",
         help=(
-            "要匹配的日期，格式: 'YYYY-MM-DD' 或 'MM-DD'（例如 '2026-01-05' 或 '01-05'）。默认: '2026-01-05 14:00'（删除该时间点之后的文档）。\n"
+            "要匹配的日期，格式: 'YYYY-MM-DD' 或 'MM-DD'（例如 '2026-01-05' 或 '01-05'）。默认: '2026-01-17 14:00'（删除该时间点之后的文档）。\n"
             "若需按整日/月日匹配，可传 'YYYY-MM-DD' 或 'MM-DD'（例如 '01-05'）。"
         ),
     )
@@ -80,7 +80,7 @@ def _parse_args() -> argparse.Namespace:
         "-c",
         "--collections",
         nargs="+",
-        default=["hot_trends", "weibo_comments", "weibo_contents"],
+        default=["hot_trends", "weibo_comments", "weibo_contents","hot_trends_history"],
         help="要处理的集合，默认: hot_trends weibo_comments weibo_contents",
     )
     p.add_argument(
@@ -116,7 +116,7 @@ def main():
         try:
             regex = _build_regex_for_date(args.date)
         except ValueError as e:
-            print(f"❌ 参数错误: {e}")
+            print(f" 参数错误: {e}")
             return
 
     total_preview = 0
@@ -135,10 +135,10 @@ def main():
         try:
             threshold_dt = _dt.strptime(threshold_str, fmt)
         except Exception:
-            print(f"❌ 无法解析时间阈值: {threshold_str}")
+            print(f" 无法解析时间阈值: {threshold_str}")
             return
 
-        print(f"🔎 将删除 last_collected > {threshold_str} 的文档 (使用日期解析比较)")
+        print(f"INFO: 将删除 last_collected > {threshold_str} 的文档 (使用日期解析比较)")
 
         # Mongo 查询使用 $expr + $dateFromString：解析文档字段并与阈值比较
         query = {
@@ -155,7 +155,7 @@ def main():
             try:
                 cnt = coll.count_documents(query)
             except Exception as e:
-                print(f"⚠️ 读取集合 {coll_name} 时出错: {e}")
+                print(f" 读取集合 {coll_name} 时出错: {e}")
                 cnt = 0
             print(
                 f" - 集合 `{coll_name}` 匹配到 {cnt} 条文档 (last_collected > {threshold_str})"
@@ -166,21 +166,21 @@ def main():
         # 原有日期/月份匹配逻辑
         query = {"last_collected": {"$regex": regex}}
 
-        print(f"🔎 将匹配 last_collected 正则: {regex}")
+        print(f"INFO: 将匹配 last_collected 正则: {regex}")
 
         for coll_name in args.collections:
             coll = db[coll_name]
             try:
                 cnt = coll.count_documents(query)
             except Exception as e:
-                print(f"⚠️ 读取集合 {coll_name} 时出错: {e}")
+                print(f" 读取集合 {coll_name} 时出错: {e}")
                 cnt = 0
             print(f" - 集合 `{coll_name}` 匹配到 {cnt} 条文档")
             total_preview += cnt
 
     if not args.execute:
         print(
-            "\n⚠️ 当前为预览模式（dry-run），不会执行删除。若确认删除，请加 --execute 参数并再次运行。"
+            "\n 当前为预览模式（dry-run），不会执行删除。若确认删除，请加 --execute 参数并再次运行。"
         )
         return
 
@@ -196,17 +196,17 @@ def main():
         coll = db[coll_name]
         try:
             res = coll.delete_many(query)
-            print(f"✅ 已从 `{coll_name}` 删除 {res.deleted_count} 条文档")
+            print(f" 已从 `{coll_name}` 删除 {res.deleted_count} 条文档")
             total_deleted += res.deleted_count
         except Exception as e:
-            print(f"❌ 删除 `{coll_name}` 失败: {e}")
+            print(f" 删除 `{coll_name}` 失败: {e}")
 
-    print(f"\n🎯 完成，总共删除 {total_deleted} 条文档。")
+    print(f"\n 完成，总共删除 {total_deleted} 条文档。")
 
     # 小提醒：若你使用的是带时间阈值模式，删除条件使用了 MongoDB 的 $dateFromString，确保你的 MongoDB 版本支持该表达式（MongoDB 4.0+ 一般支持）。
     if dt_with_time:
         print(
-            "⚠️ 注意：时间阈值比较使用了 Mongo 的 $dateFromString 解析，如果数据库字段中存在不规范的时间字符串，可能会被忽略。"
+            " 注意：时间阈值比较使用了 Mongo 的 $dateFromString 解析，如果数据库字段中存在不规范的时间字符串，可能会被忽略。"
         )
 
 

@@ -1,6 +1,6 @@
 # app/etl/event_merger.py
 """
-🔥 重构版 ETL：移除 LLM 聚类，改用简单的精确匹配热度累加
+ 重构版 ETL：移除 LLM 聚类，改用简单的精确匹配热度累加
 只有当热搜关键词完全相同（字符串精确匹配）时才累加热度
 返回热度 Top 20 的热搜词条
 支持按类别筛选：综合(不筛选)、社会、高校、生活、科技、政治、其他
@@ -21,7 +21,7 @@ class EventMerger:
     """
 
     def __init__(self):
-        # 🔥 移除所有 LLM 相关初始化
+        #  移除所有 LLM 相关初始化
         # 不再需要 structured_llm 和 review_llm
         pass
 
@@ -29,7 +29,7 @@ class EventMerger:
         self, start_date: str, end_date: str, category: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        🔥 重构版：简单的精确匹配热度累加
+         重构版：简单的精确匹配热度累加
         只有当热搜关键词完全相同（字符串精确匹配）时才累加热度
         返回热度 Top 20 的热搜词条
 
@@ -43,20 +43,20 @@ class EventMerger:
 
         category_label = f"【{category}】" if filter_category else "【综合】"
         logger.info(
-            f"🚀 [ETL] 开始执行 {category_label} 事件归并 ({start_date} ~ {end_date})..."
+            f" [ETL] 开始执行 {category_label} 事件归并 ({start_date} ~ {end_date})..."
         )
-        logger.info("   📌 策略：精确匹配累加热度，不使用 LLM 聚类")
+        logger.info("    策略：精确匹配累加热度，不使用 LLM 聚类")
 
         if filter_category:
-            logger.info(f"   📌 类别筛选：{filter_category}")
+            logger.info(f"    类别筛选：{filter_category}")
 
         # 1. 捞取快照数据
         raw_items = mongo_db.get_raw_trend_items(start_date, end_date)
         if not raw_items:
-            logger.warning("⚠️ [ETL] 无可用数据")
+            logger.warning(" [ETL] 无可用数据")
             return []
 
-        logger.info(f"   📥 [ETL] 获取到 {len(raw_items)} 条原始数据")
+        logger.info(f"    [ETL] 获取到 {len(raw_items)} 条原始数据")
 
         # 2. 精确匹配累加：只有完全相同的词条才累加热度
         word_heat_map: Dict[str, int] = defaultdict(int)
@@ -71,7 +71,7 @@ class EventMerger:
 
                 item_category = item.get("category")
 
-                # 🔥 类别筛选：如果指定了类别，只处理该类别的词条
+                #  类别筛选：如果指定了类别，只处理该类别的词条
                 if filter_category:
                     if item_category != filter_category:
                         continue
@@ -79,7 +79,7 @@ class EventMerger:
                 # 兼容处理 '123,456' 这种带逗号的字符串
                 heat_val = int(str(item.get("num", 0)).replace(",", ""))
 
-                # 🔥 精确匹配：只有完全相同的字符串才累加
+                #  精确匹配：只有完全相同的字符串才累加
                 word_heat_map[word] += heat_val
 
                 # 记录最早时间
@@ -96,10 +96,10 @@ class EventMerger:
                     word_category_map[word] = item_category
 
             except Exception as e:
-                logger.debug(f"   ⚠️ [ETL] 跳过无效数据: {e}")
+                logger.debug(f"    [ETL] 跳过无效数据: {e}")
                 continue
 
-        logger.info(f"   📊 [ETL] 筛选后共 {len(word_heat_map)} 个热搜词条")
+        logger.info(f"    [ETL] 筛选后共 {len(word_heat_map)} 个热搜词条")
 
         # 3. 按热度排序，取 Top 20
         sorted_items = sorted(word_heat_map.items(), key=lambda x: x[1], reverse=True)[
@@ -144,7 +144,7 @@ class EventMerger:
                     "related_keywords": [word],  # 保留原始关键词（含 #）
                     "total_heat": total_heat,
                     "heat_score": total_heat,
-                    "category": item_cat,  # 🔥 新增类别字段
+                    "category": item_cat,  #  新增类别字段
                     "merge_reason": "精确匹配累加",  # 说明这是简单累加，非 LLM 聚类
                     "period": f"{start_date} to {end_date}",
                     "created_at": created_at,
@@ -154,11 +154,11 @@ class EventMerger:
         # 5. 存入数据库
         mongo_db.save_core_events(final_events)
 
-        logger.info(f"✅ [ETL] 归并完成，已生成 Top {len(final_events)} 热搜事件")
+        logger.info(f" [ETL] 归并完成，已生成 Top {len(final_events)} 热搜事件")
         for i, evt in enumerate(final_events[:5]):
             cat_label = f"[{evt.get('category', '未分类')}]" if filter_category else ""
             logger.info(
-                f"   📌 Top{i+1}: {cat_label} {evt['event_name']} (热度: {evt['total_heat']})"
+                f"    Top{i+1}: {cat_label} {evt['event_name']} (热度: {evt['total_heat']})"
             )
 
         return final_events

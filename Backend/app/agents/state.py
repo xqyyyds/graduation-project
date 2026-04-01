@@ -1,9 +1,14 @@
 import operator
 from typing import List, Dict, Any, Annotated, TypedDict, Optional, Literal
 
-# 🔥 新增导入：LangGraph 的消息管理利器
+#  新增导入：LangGraph 的消息管理利器
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
+
+
+def _last_value(existing: str, new: str) -> str:
+    """并行节点同时写入时取最后一个值，避免 InvalidUpdateError"""
+    return new
 
 
 # 有效类别常量定义
@@ -24,14 +29,14 @@ class GraphState(TypedDict):
     task_id: str
     user_query: str
 
-    # 🔥 [新增] ETL 时间窗口参数 (用户输入)
+    #  [新增] ETL 时间窗口参数 (用户输入)
     start_date: Optional[str]  # "YYYY-MM-DD HH:MM:SS"
     end_date: Optional[str]  # "YYYY-MM-DD HH:MM:SS"
 
-    # 🔥 [新增] 趋势预测时间范围 (1w/2w/1m/2m)
+    #  [新增] 趋势预测时间范围 (1w/2w/1m/2m)
     forecast_range: Optional[str]  # "1w", "2w", "1m", "2m"
 
-    # 🔥 [新增] 类别筛选 (综合/社会/高校/生活/科技/政治/其他)
+    #  [新增] 类别筛选 (综合/社会/高校/生活/科技/政治/其他)
     category: Optional[str]  # 默认 "综合" 表示不筛选类别
 
     # === 3. Agent A (统计分析师) 的产出 ===
@@ -46,15 +51,24 @@ class GraphState(TypedDict):
     audit_results: List[Dict]
 
     # === 6. Agent D (趋势预测师) 的产出 ===
-    # 🔥 修改：改为 Any 或 Dict，因为 Agent D 返回的是 TrendForecastReport 对象(字典)
+    #  修改：改为 Any 或 Dict，因为 Agent D 返回的是 TrendForecastReport 对象(字典)
     trend_forecast: Dict[str, Any]
+
+    # === 6.5 Agent Historical (历史同期回顾) 的产出 ===
+    #  历史同期事件数据 (HistoricalEventsList 字典格式)
+    historical_events: Optional[Dict[str, Any]]
 
     # === 7. Agent E (前言/最终报告) 的产出 ===
     final_report: str
 
-    # 🔥 [新增] 违规统计数据 (用于存入 report_sessions 供 Dashboard 聚合)
+    #  [新增] 违规统计数据 (用于存入 report_sessions 供 Dashboard 聚合)
     violation_stats: Dict[str, int]
 
-    # === 8. 系统控制字段 ===
-    error: str
-    current_step: str
+    # === 8. 质量门控 (Agent 协作架构) ===
+    quality_scores: Dict[str, Any]      # {agent_name: QualityScore dict} 各 Agent 输出的质量评分
+    retry_count: Dict[str, int]         # {agent_name: count} 各 Agent 重试次数
+    supervisor_feedback: Annotated[str, _last_value]  # Supervisor 的整体反馈
+
+    # === 9. 系统控制字段 ===
+    error: Annotated[str, _last_value]
+    current_step: Annotated[str, _last_value]

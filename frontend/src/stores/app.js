@@ -27,7 +27,7 @@ export const useAppStore = defineStore("app", () => {
   const sidebarCollapsed = ref(loadState("sidebarCollapsed", false));
   const currentTask = ref(loadState("currentTask", null));
   
-  // 🔥🔥🔥 核心修改：将计时起始时间独立存储，不依赖 API 返回的对象 🔥🔥🔥
+  //  核心修改：将计时起始时间独立存储，不依赖 API 返回的对象 
   const taskStartTime = ref(loadState("taskStartTime", 0)); 
   
   const taskPollingInterval = ref(null);
@@ -79,7 +79,7 @@ export const useAppStore = defineStore("app", () => {
   watch(settings, (val) => saveState("appSettings", val), { deep: true });
   watch(themeConfig, (val) => saveState("themeConfig", val), { deep: true });
   
-  // 🔥 新增：单独监听并持久化开始时间，确保刷新页面时间不丢失
+  //  新增：单独监听并持久化开始时间，确保刷新页面时间不丢失
   watch(taskStartTime, (val) => saveState("taskStartTime", val));
 
   // ==========================================
@@ -125,7 +125,7 @@ export const useAppStore = defineStore("app", () => {
       // 1. 先调用 API
       const data = await api.createTask(params);
       
-      // 2. 🔥 成功后，立即记录当前时间为开始时间
+      // 2.  成功后，立即记录当前时间为开始时间
       taskStartTime.value = Date.now();
       
       // 3. 更新任务状态
@@ -156,7 +156,7 @@ export const useAppStore = defineStore("app", () => {
     try {
       const status = await api.getTaskStatus(taskId);
       
-      // 🔥 修改：直接覆盖 currentTask，不需要手动处理时间戳
+      //  修改：直接覆盖 currentTask，不需要手动处理时间戳
       // 因为时间戳现在存在 taskStartTime 变量里，这里怎么覆盖都安全
       currentTask.value = status;
 
@@ -196,13 +196,13 @@ export const useAppStore = defineStore("app", () => {
   const clearCurrentTask = () => {
     stopTaskPolling();
     currentTask.value = null;
-    taskStartTime.value = 0; // 🔥 任务重置时，清空时间
+    taskStartTime.value = 0; //  任务重置时，清空时间
   };
 
   return {
     sidebarCollapsed,
     currentTask,
-    taskStartTime, // 🔥 记得导出这个变量给组件使用
+    taskStartTime, //  记得导出这个变量给组件使用
     dashboardStats,
     reports,
     selectedCategory,

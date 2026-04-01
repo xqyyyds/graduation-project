@@ -156,7 +156,7 @@ class CategoryClassifier:
     def classify_parallel(
         self,
         words: List[str],
-        max_workers: int = 5,
+        max_workers: int = 8,
         existing_categories: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         """

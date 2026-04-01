@@ -48,11 +48,11 @@ def verify_api():
         except Exception:
             content = str(res)
 
-        print("\n✅ 验证成功！")
+        print("\n 验证成功！")
         print(f"模型回复: {content}")
 
     except Exception as e:
-        print("\n❌ 验证失败或发生异常！")
+        print("\n 验证失败或发生异常！")
         print(f"错误: {e}")
 
 

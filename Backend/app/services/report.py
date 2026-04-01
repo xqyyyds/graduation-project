@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -11,7 +11,7 @@ from app.core.schemas import PrefaceSection
 from app.core.prompts import AGENT_E_PREFACE_TEMPLATE
 
 # 工具：归一化违规类别文本，避免细微差异拆桶
-from app.agents.tools import normalize_category
+from app.services.utils import normalize_category
 
 
 class AgentReport:
@@ -29,11 +29,52 @@ class AgentReport:
         )
         # self.preface_parser = JsonOutputParser(pydantic_object=PrefaceSection) (已弃用)
 
+    def _compute_stats(
+        self, core_events: List, audit_results: List, analyzed_events: List
+    ) -> Dict[str, int]:
+        """计算报告统计数据，作为 Source of Truth"""
+        violation_list = [r for r in audit_results if r.get("is_violation")]
+        high_risk_list = [
+            r
+            for r in audit_results
+            if (r.get("violation_info") or {}).get("overall_risk_level") == "High"
+        ]
+
+        return {
+            "total_events": len(core_events),
+            "analyzed_count": len(analyzed_events),
+            "violation_count": len(violation_list),
+            "high_risk_count": len(high_risk_list),
+        }
+
+    def _validate_preface_numbers(
+        self, preface_text: str, stats: Dict[str, int]
+    ) -> tuple:
+        """
+        校验前言中的数字是否与统计数据一致
+        返回: (是否通过, 错误信息)
+        """
+        import re
+
+        # 提取前言中的所有数字
+        numbers_in_text = [int(n) for n in re.findall(r"\d+", preface_text)]
+        expected_numbers = set(stats.values())
+
+        errors = []
+        for num in numbers_in_text:
+            # 如果前言中出现了不在预期范围内的大数字（>100），可能是幻觉
+            if num > 100 and num not in expected_numbers:
+                errors.append(f"检测到可疑数字: {num}")
+
+        if errors:
+            return False, "; ".join(errors)
+        return True, ""
+
     def generate_full_report(self, state_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         生成报告全流程
         """
-        logger.info("📝 [Agent E] 正在统筹全篇，撰写舆情报告...")
+        logger.info(" [Agent E] 正在统筹全篇，撰写舆情报告...")
 
         # 0. 研判周期（强制使用用户输入，禁止模型杜撰年份）
         start_date = (state_data.get("start_date") or "").strip()
@@ -48,16 +89,16 @@ class AgentReport:
             report_period = "本期（默认最近24小时）"
 
         # 1. 准备素材
-        # 🔥 获取 Agent A 的完整榜单 (用于生成表格)
+        #  获取 Agent A 的完整榜单 (用于生成表格)
         core_events = state_data.get("core_events", [])
 
-        # 🔥 获取 Agent B 分析完的事件 (现在 Nodes.py 改完后这里会有 5 个)
+        #  获取 Agent B 分析完的事件 (现在 Nodes.py 改完后这里会有 5 个)
         analyzed_events = state_data.get("analyzed_events", [])
 
         audit_results = state_data.get("audit_results", [])
         trend_report = state_data.get("trend_forecast", {})
 
-        # 🔥 生成结构化违规统计（主贴 + 评论）供持久化与 API 使用
+        #  生成结构化违规统计（主贴 + 评论）供持久化与 API 使用
         # 使其与附录表格（_assemble_markdown 中的 category_counts）保持一致：
         # 优先使用 evidence_report.violated_categories（若存在且为 list），否则退化为逐条统计 violated_comments 中的 category。
         violation_stats: Dict[str, int] = {}
@@ -136,7 +177,7 @@ class AgentReport:
             ):
                 violations.append(r)
 
-        # 🔥 升级：生成更丰富的合规摘要，供 Agent E 写前言
+        #  升级：生成更丰富的合规摘要，供 Agent E 写前言
         # 初始化 cat_counts，确保即使无违规也有此变量
         cat_counts = {}
 
@@ -168,7 +209,7 @@ class AgentReport:
                 reason = typical.get("reasoning") or "涉及敏感内容"
                 audit_str += f" 典型案例涉及：{reason}。"
 
-        # 🔥 适配新版 TrendForecastReport (topics 列表)
+        #  适配新版 TrendForecastReport (topics 列表)
         topics = trend_report.get("topics", [])
         if topics:
             # 提取每个议题的标题作为摘要
@@ -176,6 +217,14 @@ class AgentReport:
             trend_str = f"下月重点关注议题：{'; '.join(topic_titles)}。"
         else:
             trend_str = "下月定调: 暂无明确预测数据"
+
+        # 计算数据锚定统计
+        stats = self._compute_stats(
+            core_events=core_events,
+            analyzed_events=analyzed_events,
+            audit_results=audit_results,
+        )
+        logger.debug(f"[Agent E] 数据锚定统计: {stats}")
 
         preface = self._generate_preface(
             report_period=report_period,
@@ -185,6 +234,7 @@ class AgentReport:
             a_str=audit_str,
             t_str=trend_str,
             category=state_data.get("category", "综合"),
+            stats=stats,
         )
 
         # 二次兜底：强制覆盖 report_period，避免模型乱写年份
@@ -193,17 +243,32 @@ class AgentReport:
         except Exception:
             pass
 
+        # 校验前言数字一致性（仅日志记录）
+        preface_text = f"{preface.overview or ''} {preface.conclusion or ''}"
+        is_valid, mismatch_msg = self._validate_preface_numbers(preface_text, stats)
+        if not is_valid:
+            logger.warning(f"[Agent E] 前言数字校验不一致: {mismatch_msg}")
+        else:
+            logger.debug("[Agent E] 前言数字校验通过")
+
         # 3. 组装 Markdown (传入 core_events 用于表格)
         category = state_data.get("category", "综合")
+        historical_events = state_data.get("historical_events")
         md_content = self._assemble_markdown(
-            preface, core_events, analyzed_events, violations, trend_report, category
+            preface,
+            core_events,
+            analyzed_events,
+            violations,
+            trend_report,
+            category,
+            historical_events,
         )
 
         # 4. 保存 Markdown 文件 (不再生成 PDF，建议用 Typora 等工具打开 .md 导出)
         md_filename = f"舆情研判_{category}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
         md_path = self._save_markdown(md_content, md_filename)
 
-        # 🔥 返回违规统计数据，供下游写入 Session
+        #  返回违规统计数据，供下游写入 Session
         return {
             "markdown": md_content,
             "md_path": md_path,
@@ -221,13 +286,28 @@ class AgentReport:
         a_str: str,
         t_str: str,
         category: str = "综合",
+        stats: Dict[str, int] = None,
+        improvement_hint: str = "",
     ) -> PrefaceSection:
         """调用 LLM 生成前言"""
         try:
-            # 🔥 升级：使用 with_structured_output
+            #  升级：使用 with_structured_output
             category = category if category not in ["综合", "其他"] else "全部"
             structured_llm = self.llm.with_structured_output(PrefaceSection)
             prompt = ChatPromptTemplate.from_template(AGENT_E_PREFACE_TEMPLATE)
+
+            # 构造数据锚定字符串
+            if stats:
+                stats_str = f"""
+- 热点事件总数: {stats['total_events']}
+- 深度分析事件数: {stats['analyzed_count']}
+- 违规内容数: {stats['violation_count']}
+- 高风险数: {stats['high_risk_count']}
+
+**重要约束**: 文中出现的数据必须与上述数据完全一致，严禁杜撰其他数字。
+"""
+            else:
+                stats_str = "（无统计数据）"
 
             chain = prompt | structured_llm
 
@@ -240,10 +320,12 @@ class AgentReport:
                     "audit_summary": a_str,
                     "trend_forecast": t_str,
                     "category": category,
+                    "stats": stats_str,
+                    "improvement_hint": improvement_hint,
                 }
             )
         except Exception as e:
-            logger.error(f"❌ 前言生成失败: {e}")
+            logger.error(f" 前言生成失败: {e}")
             return PrefaceSection(
                 report_period="本期",
                 overview="（生成异常）",
@@ -261,6 +343,7 @@ class AgentReport:
         c_violations: List,
         d_trend: Dict,
         category: str = "综合",
+        historical_events: Optional[Dict] = None,
     ) -> str:
         """
         拼装最终报告 (Markdown 格式)
@@ -282,7 +365,7 @@ class AgentReport:
             text = "".join(
                 ch for ch in text if (ch == "\n" or (ch >= " " and ch != "\x7f"))
             )
-            # 🔥 二次去emoji（保险起见）
+            #  二次去emoji（保险起见）
             # (这里可以加正则去 emoji，暂时先不加以免引入额外依赖，依靠 Prompt 约束)
             return text.strip()
 
@@ -424,7 +507,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         # ==============================================================================
         # 1. 封面与前言 (Cover & Preface)
         # ==============================================================================
-        title_suffix = f"（{category}）" 
+        title_suffix = f"（{category}）"
         md = css_style
         md += f"# 内容安全审核与分析报告{title_suffix}\n\n"
         md += f"**报告日期**：{date_str}\n\n"
@@ -443,7 +526,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
             label = prefix[i] if i < len(prefix) else f"特征{i+1}"
             # 移除可能重复的 "其一，" 前缀
             clean_text = char_text.replace(f"{label}，", "").replace(f"{label}：", "")
-            # 🔥 改为段落式，而非列表
+            #  改为段落式，而非列表
             md += f"{label}，{clean_text}\n\n"
         md += "\n"
 
@@ -467,7 +550,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         md += "| 序号 | 时间 | 事件名称 | 热度值 |\n"
         md += "| :---: | :---: | :--- | :---: |\n"
 
-        # 🔥 辅助函数：清理 # 号
+        #  辅助函数：清理 # 号
         def _clean_hashtag(s: str) -> str:
             """清理字符串中的 # 号"""
             if not s:
@@ -477,7 +560,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         if not core_events:
             md += "| - | - | 暂无数据 | - |\n"
         else:
-            # 🔥 去重：按 event_name 去重，保留首次出现的（热度最高的）
+            #  去重：按 event_name 去重，保留首次出现的（热度最高的）
             seen_names = set()
             unique_events = []
             for evt in core_events:
@@ -495,7 +578,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
                 heat_str = (
                     f"{heat_val/10000:.1f}万" if heat_val > 10000 else str(heat_val)
                 )
-                # 🔥 直接使用热搜标题，清理 # 号
+                #  直接使用热搜标题，清理 # 号
                 event_title = _clean_hashtag(
                     evt.get("event_name") or evt.get("topic") or "未知"
                 )
@@ -514,7 +597,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         if not b_events:
             md += "（本期无重点事件）\n"
 
-        # 🔥 去重：按 event_name 去重
+        #  去重：按 event_name 去重
         seen_b_names = set()
         unique_b_events = []
         for e in b_events:
@@ -525,14 +608,14 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
 
         for i, e in enumerate(unique_b_events):
             r = e.get("opinion_report", {})
-            # 🔥 优先使用原始热搜标题 raw_title，否则使用 event_name
+            #  优先使用原始热搜标题 raw_title，否则使用 event_name
             event_title = _clean_hashtag(
                 e.get("raw_title") or e.get("event_name") or e.get("topic") or "未知"
             )
 
             md += f"### {i+1}. 事件：《{event_title}》\n\n"
 
-            # (1) 事件概况 - 🔥 改为 h4 + 段落，与其他部分样式一致
+            # (1) 事件概况 -  改为 h4 + 段落，与其他部分样式一致
             md += f"#### 事件概况\n\n"
             md += f"{_normalize_body_text(r.get('event_overview', '暂无概况'))}\n\n"
 
@@ -555,15 +638,52 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         md += "<div style='page-break-after: always;'></div>\n\n"
 
         # ==============================================================================
+        # 3.5 历史同期热门事件回顾 (Historical Review)
+        # ==============================================================================
+        if historical_events and historical_events.get("events"):
+            events_list = historical_events.get("events", [])
+            summary = historical_events.get("summary", "")
+
+            md += "## 历史同期热门事件回顾\n\n"
+
+            # 使用 LLM 生成的导语
+            if summary:
+                md += f"{_normalize_body_text(summary)}\n\n"
+
+            # 表格
+            md += "| 日期 | 热门事件 |\n"
+            md += "| :---: | :--- |\n"
+
+            for evt in events_list:
+                date = evt.get("date", "")
+                title = evt.get("event_title", "")
+                evt_summary = evt.get("event_summary", "")
+
+                # 转义 Markdown 表格分隔符
+                title = title.replace("|", r"\|")
+                evt_summary = evt_summary.replace("|", r"\|")
+
+                # 组合标题和摘要
+                event_text = f"**{title}**<br>{evt_summary}" if evt_summary else title
+
+                md += f"| {date} | {event_text} |\n"
+
+            md += "\n<div style='page-break-after: always;'></div>\n\n"
+        else:
+            # 如果没有历史数据，可以选择不显示或显示占位符
+            # 这里选择不显示该章节
+            pass
+
+        # ==============================================================================
         # 4. 未来趋势与战略预警 (Forecast)
         # ==============================================================================
         md += "## 第三部分：未来趋势与战略预警\n\n"
 
-        # 适配新版 Schema (TrendForecastReport: target_month, topics)
+        # 适配新版 Schema (TrendForecastReport: target_period, topics)
         topics = d_trend.get("topics", [])
 
         if topics:
-            md += f"**研判周期**：{d_trend.get('target_month', '下月')}\n\n"
+            md += f"**研判周期**：{d_trend.get('target_period', '下月')}\n\n"
 
             for i, topic in enumerate(topics):
                 title = topic.get("topic_name", "重点议题")
@@ -781,6 +901,23 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
                 if info is None:
                     continue
 
+                # 内容过滤拦截的帖子：填充"审查受限"而非留空
+                if info.get("content_filter_blocked"):
+                    post_content = v.get("post_content", "")
+                    truncated = (
+                        post_content.strip()[:40] + "..."
+                        if len(post_content.strip()) > 40
+                        else post_content.strip()
+                    )
+                    md += (
+                        f"| {case_num} | - | "
+                        f"【帖】{_esc_cell(truncated) if truncated else '-'} | "
+                        f" | "
+                        f"建议人工复审 | "
+                        f"人工复审 |\n"
+                    )
+                    continue
+
                 risk = (
                     info.get("overall_risk_level")
                     or (info.get("evidence_report") or {}).get("overall_risk_level")
@@ -806,7 +943,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
                     for vc in violated_comment_originals:
                         content = vc.get("content", "")
 
-                        # 🔥🔥🔥【修改】完全去掉数量限制和长度截断 🔥🔥🔥
+                        # 【修改】完全去掉数量限制和长度截断
                         if content and content not in seen_comments:
                             seen_comments.add(content)
 
@@ -860,7 +997,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
     def _save_markdown(self, md_content: str, filename: str) -> str:
         """
         保存 Markdown 文件
-        🔥 不再生成 PDF（xhtml2pdf 中文支持差），建议用 Typora/VS Code 打开 .md 导出
+         不再生成 PDF（xhtml2pdf 中文支持差），建议用 Typora/VS Code 打开 .md 导出
         """
         output_dir = "output"
         os.makedirs(output_dir, exist_ok=True)
@@ -869,10 +1006,10 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         try:
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(md_content)
-            logger.info(f"✅ Markdown 报告已保存: {md_path}")
+            logger.info(f" Markdown 报告已保存: {md_path}")
             return md_path
         except Exception as e:
-            logger.error(f"❌ Markdown 保存失败: {e}")
+            logger.error(f" Markdown 保存失败: {e}")
             return ""
 
 

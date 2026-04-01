@@ -1,8 +1,8 @@
 # app/core/schemas.py
 from __future__ import annotations
 
-from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, conlist
+from typing import List, Optional, Literal, Dict, Any
+from pydantic import BaseModel, Field
 
 
 # =====================================================
@@ -143,13 +143,13 @@ class AuditAnalysis(BaseModel):
 class ComplianceResult(BaseModel):
     """Agent C 的最终输出结构 (单条模式用)"""
 
-    verdict: str = Field(description="最终结论 (✅ 通过 / ❌ 违规)")
+    verdict: str = Field(description="最终结论 ( 通过 /  违规)")
     analysis: AuditAnalysis = Field(description="详细分析对象")
     report: str = Field(description="生成的简短审核报告")
     evidence: Optional[str] = Field(None, description="违规内容的原文摘录")
 
 
-# 🔥 [新增] Batch 模式专用：单个违规项详情
+#  [新增] Batch 模式专用：单个违规项详情
 class ViolatedItem(BaseModel):
     """
     批量审查中的单个违规记录
@@ -174,7 +174,7 @@ class ViolatedItem(BaseModel):
     )
 
 
-# 🔥 [新增] Batch 模式专用：整体审查结果
+#  [新增] Batch 模式专用：整体审查结果
 class BatchComplianceResult(BaseModel):
     """
     Agent C 的最终输出：批量审查结果容器
@@ -233,16 +233,14 @@ class ForecastPoint(BaseModel):
     )
     content: str = Field(
         ...,
-        min_length=80,
-        description="【深度研判内容】必须包含三个要素：1.触发场景（未来什么具体事件或时间节点会触发此风险）；2.演化路径（舆情将如何从点扩散到面）；3.落地建议（具体的防范或应对措施）。禁止空泛的废话。",
+        description="深度研判内容(不少于200字)，必须包含三个要素：1.触发场景（未来什么具体事件或时间节点会触发此风险）；2.演化路径（舆情将如何从点扩散到面）；3.落地建议（具体的防范或应对措施）。禁止空泛的废话。",
     )
     likelihood: Literal["高", "中", "低"] = Field(
         ..., description="该风险在预测周期内发生的概率评估。"
     )
     evidence_basis: List[str] = Field(
         ...,
-        description="【预测依据】必须列出支撑该预测的逻辑来源。例如：['历史规律：往年3月均为高校心理危机高发期', '未来情报：预计XX新规将于下月实施']。禁止仅引用'当前舆论情绪'。",
-        min_length=1,
+        description="预测依据(至少1条)，必须列出支撑该预测的逻辑来源。例如：['历史规律：往年3月均为高校心理危机高发期', '未来情报：预计XX新规将于下月实施']。必须至少包含1条历史数据或未来情报，禁止仅引用当前舆论情绪。",
     )
 
 
@@ -255,14 +253,11 @@ class ForecastTopic(BaseModel):
     )
     background: str = Field(
         ...,
-        description="【未来视角背景】简述下个周期（研判目标月）的特殊性（如：适逢开学季/政策窗口期/敏感纪念日/特定季节特征）。说明为何在该时间节点此议题会爆发。",
-        min_length=60,
+        description="【未来视角背景】(不少于60字)简述下个周期（研判目标月）的特殊性（如：适逢开学季/政策窗口期/敏感纪念日/特定季节特征）。说明为何在该时间节点此议题会爆发。",
     )
     points: List[ForecastPoint] = Field(
         ...,
-        min_length=3,
-        max_length=5,
-        description="该议题下的具体风险演化点（3-5个）。",
+        description="该议题下的具体风险演化点（必须3-5个）。",
     )
 
 
@@ -278,9 +273,7 @@ class TrendForecastReport(BaseModel):
 
     topics: List[ForecastTopic] = Field(
         ...,
-        min_length=3,
-        max_length=5,
-        description="【核心议题预测】列出 3-5 个下个月最需要关注的舆情风险议题。要求各议题维度互不重复（正交）。",
+        description="【核心议题预测】列出 3-5 个(必须3-5个)下个月最需要关注的舆情风险议题。要求各议题维度互不重复（正交）。",
     )
 
 
@@ -323,7 +316,44 @@ class PrefaceSection(BaseModel):
 
 
 # =====================================================
-# 7. 事件去重判断 (Agent B 深度分析前)
+# 7. 历史同期热门事件回顾 (Agent Historical)
+# =====================================================
+
+
+class HistoricalDailyEvent(BaseModel):
+    """历史同期每天的热门事件"""
+
+    date: str = Field(..., description="日期，格式: YYYY-MM-DD")
+    event_title: str = Field(
+        ...,
+        description="事件标题，简洁明了的描述（如：成都官方通报游客遭强迫购物）",
+    )
+    event_summary: str = Field(
+        ...,
+        description="事件简短总结，50-100字，概括事件核心内容和影响",
+    )
+
+
+class HistoricalEventsList(BaseModel):
+    """历史同期事件列表容器"""
+
+    year_month: str = Field(..., description="年份-月份，格式: YYYY-MM")
+    events: List[HistoricalDailyEvent] = Field(
+        ..., description="该月每天的热门事件列表"
+    )
+
+
+class HistoricalSummary(BaseModel):
+    """历史同期回顾章节导语"""
+
+    summary_text: str = Field(
+        ...,
+        description="导语文本，一段话，80-200字(不少于80字)。客观说明历史回顾的意义，分析该月舆情特点。风格严肃，严禁使用 Emoji。",
+    )
+
+
+# =====================================================
+# 8. 事件去重判断 (Agent B 深度分析前)
 # =====================================================
 
 
@@ -337,4 +367,35 @@ class EventDuplicateCheck(BaseModel):
     reasoning: str = Field(
         ...,
         description="判断理由。简要说明为什么是/不是同一事件。如果是同一事件，需说明它们的关联（如：都是关于小洛熙案件的不同角度报道）。",
+    )
+
+
+# =====================================================
+# 质量门控 Schema (Agent 协作架构)
+# =====================================================
+
+
+class QualityScore(BaseModel):
+    """Supervisor 对 Agent 输出的质量评估"""
+
+    agent_name: str = Field(
+        ..., description="被评估的 Agent 名称(如：agent_b, agent_c, agent_d)"
+    )
+    completeness: int = Field(
+        ..., ge=0, le=10, description="完整性得分(0-10)：是否覆盖所有必要维度"
+    )
+    accuracy: int = Field(
+        ..., ge=0, le=10, description="准确性得分(0-10)：数据引用是否准确"
+    )
+    depth: int = Field(
+        ..., ge=0, le=10, description="深度得分(0-10)：分析是否有独立见解而非复述"
+    )
+    overall: int = Field(
+        ..., ge=0, le=10, description="综合评分(0-10)：加权平均或管理员判断"
+    )
+    passed: bool = Field(..., description="是否通过质量门控(overall>=7为通过)")
+    feedback: str = Field(..., description="质量反馈：通过则为空，不通过则给出改进建议")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="可选的额外元数据(如: check_type, rule_violations, llm_rationale)",
     )

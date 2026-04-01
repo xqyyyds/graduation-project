@@ -35,7 +35,7 @@ def run_task(
         """报告进度"""
         if progress_callback:
             progress_callback(progress, step, message)
-        print(f"📊 [{progress}%] {step}: {message}")
+        print(f" [{progress}%] {step}: {message}")
 
     # --- 1. ID 初始化 ---
     if not thread_id:
@@ -43,18 +43,18 @@ def run_task(
         today = datetime.datetime.now().strftime("%Y%m%d")
         short_uuid = str(uuid.uuid4())[:6]
         thread_id = f"task_{today}_{short_uuid}"
-        print(f"\n🆕 [System] 正在初始化新任务...")
+        print(f"\n [System] 正在初始化新任务...")
     else:
-        print(f"\n🔄 [System] 正在尝试恢复任务...")
+        print(f"\n [System] 正在尝试恢复任务...")
 
     report_progress(5, "初始化", "正在准备任务环境...")
 
     category_label = (
         f"【{category}】" if category and category != "综合" else "【综合】"
     )
-    print(f"🆔 任务 ID (Thread ID): {thread_id}")
-    print(f"📅 分析周期: {start_date or '默认(最近24h)'} ~ {end_date or '默认'}")
-    print(f"🏷️ 类别筛选: {category_label}")
+    print(f" 任务 ID (Thread ID): {thread_id}")
+    print(f" 分析周期: {start_date or '默认(最近24h)'} ~ {end_date or '默认'}")
+    print(f" 类别筛选: {category_label}")
     print("-" * 50)
 
     # --- 2. 注入记忆 & 编译图 ---
@@ -62,31 +62,31 @@ def run_task(
     report_progress(10, "初始化", "正在连接数据库...")
     with checkpointer_manager.get_checkpointer() as checkpointer:
 
-        # 🔥 关键：在这里把 workflow 编译成可运行的 app，并挂载记忆
+        #  关键：在这里把 workflow 编译成可运行的 app，并挂载记忆
         app = workflow.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
 
-        # --- 🔥 特殊功能：仅重新生成报告 ---
+        # ---  特殊功能：仅重新生成报告 ---
         if regenerate_report:
             if not thread_id:
-                print("❌ 错误：使用 --regenerate_report 必须提供 --id 参数")
+                print(" 错误：使用 --regenerate_report 必须提供 --id 参数")
                 return
 
-            print(f"📝 [System] 检测到重新生成报告指令，正在读取缓存状态...")
+            print(f" [System] 检测到重新生成报告指令，正在读取缓存状态...")
             snapshot = app.get_state(config)
             if not snapshot.values:
-                print("❌ 错误：未找到该任务的有效缓存状态，无法生成报告。")
+                print(" 错误：未找到该任务的有效缓存状态，无法生成报告。")
                 return
 
-            print("✅ 缓存读取成功，正在调用 Agent E...")
+            print(" 缓存读取成功，正在调用 Agent E...")
             # 动态导入避免循环引用
             from app.agents.nodes import agent_e_node
 
             try:
                 agent_e_node(snapshot.values)
-                print(f"✨✨ 报告重新生成完毕！ ✨✨")
+                print(f" 报告重新生成完毕！ ")
             except Exception as e:
-                print(f"❌ 报告生成失败: {e}")
+                print(f" 报告生成失败: {e}")
                 import traceback
 
                 traceback.print_exc()
@@ -103,13 +103,20 @@ def run_task(
             "end_date": end_date,
             "forecast_range": forecast_range,  # 预测时间范围
             "category": category,  # 类别筛选
-            # 初始化空列表，防止首次运行报错
+            # 初始化所有字段，防止首次运行报错
             "messages": [],
+            "raw_trends": [],
             "core_events": [],
+            "pending_posts": [],
             "analyzed_events": [],
             "audit_results": [],
             "trend_forecast": {},
+            "historical_events": None,
             "final_report": "",
+            "violation_stats": {},
+            "quality_scores": {},
+            "retry_count": {},
+            "supervisor_feedback": "",
             "error": "",
             "current_step": "Start",
         }
@@ -117,55 +124,80 @@ def run_task(
         # 配置信息 (告诉 LangGraph 当前是哪个线程)
         config = {"configurable": {"thread_id": thread_id}}
 
-        # 节点名称到进度的映射
+        # 节点名称到进度的映射 (与 workflow.py 14 节点一一对应)
         node_progress_map = {
-            "data_collector": (15, "数据采集", "正在采集热搜数据..."),
-            "agent_a": (30, "热度统计", "Agent A 正在分析热度数据..."),
-            "agent_b": (50, "观点分析", "Agent B 正在进行深度观点分析..."),
-            "agent_c": (65, "合规审查", "Agent C 正在进行合规性审查..."),
-            "agent_d": (80, "趋势预测", "Agent D 正在预测舆情趋势..."),
+            "node_classify": (15, "数据分类", "Agent 正在对热搜进行分类..."),
+            "agent_a": (25, "数据准备", "Agent A 正在执行 ETL + 选题 + 数据拓展..."),
+            "agent_b_analyze": (40, "观点分析", "Agent B 正在进行深度舆情分析..."),
+            "agent_c": (50, "合规审查", "Agent C 正在进行合规性审查..."),
+            "quality_gate_bc": (58, "质量评估", "LLM 正在评估 B+C 输出质量..."),
+            "agent_d": (70, "趋势预测", "Agent D 正在预测舆情趋势..."),
+            # "agent_historical": (72, "历史回顾", ...),  # 暂不启用
+            "quality_gate_d": (80, "质量评估", "LLM 正在评估 D 输出质量..."),
             "agent_e": (90, "报告生成", "Agent E 正在生成研判报告..."),
         }
 
         # --- 4. 启动流式运行 ---
-        report_progress(12, "数据采集", "正在启动工作流...")
+        report_progress(12, "数据分类", "正在启动工作流...")
         try:
             # app.stream 会一步步执行节点
             # stream_mode="updates" 表示只返回状态更新的部分
             step_count = 0
+            completed_nodes = set()  # 跟踪已完成的节点
+
+            # 并行节点组：同组全部完成后才预告下一阶段
+            _parallel_groups = {
+                "agent_b_analyze": "bc_group",
+                "agent_c": "bc_group",
+                # agent_d 不再与 historical 并行，无需分组
+            }
+            _group_next_hint = {
+                "bc_group": (57, "质量评估", "LLM 正在评估 B+C 输出质量..."),
+            }
+
             for output in app.stream(initial_state, config=config):
                 step_count += 1
                 for node_name, state_delta in output.items():
-                    # 这里可以打印当前节点产出的关键信息
                     step_info = state_delta.get("current_step", "Running...")
                     print(
-                        f"✅ [Step {step_count}] 节点 '{node_name}' 完成 -> {step_info}"
+                        f" [Step {step_count}] 节点 '{node_name}' 完成 -> {step_info}"
                     )
+                    completed_nodes.add(node_name)
 
                     # 报告进度
                     if node_name in node_progress_map:
                         prog, step, msg = node_progress_map[node_name]
                         report_progress(prog, step, f"{step}完成")
 
-                        # 立即将下一个节点标记为“处理中”（若存在），避免前端显示延后一拍
-                        try:
-                            node_keys = list(node_progress_map.keys())
-                            idx = node_keys.index(node_name)
-                            if idx + 1 < len(node_keys):
-                                next_name = node_keys[idx + 1]
-                                next_prog, next_step, _ = node_progress_map[next_name]
-                                # 保持进度递增且不跳跃过大：取 min(next_prog-1, prog+1)
-                                processing_prog = min(next_prog - 1, prog + 1)
-                                report_progress(
-                                    processing_prog,
-                                    next_step,
-                                    f"{next_step}处理中...",
-                                )
-                        except Exception:
-                            # 忽略任何边界或索引错误，正常运行即可
-                            pass
+                        group = _parallel_groups.get(node_name)
+                        if group:
+                            # 并行节点：等同组全部完成后才预告下一阶段
+                            siblings = [
+                                n for n, g in _parallel_groups.items() if g == group
+                            ]
+                            if all(s in completed_nodes for s in siblings):
+                                np, ns, _ = _group_next_hint[group]
+                                report_progress(np, ns, f"{ns}处理中...")
+                            # 否则不预告，避免误导
+                        else:
+                            # 非并行节点：直接预告下一步
+                            try:
+                                node_keys = list(node_progress_map.keys())
+                                idx = node_keys.index(node_name)
+                                if idx + 1 < len(node_keys):
+                                    next_name = node_keys[idx + 1]
+                                    next_prog, next_step, _ = node_progress_map[
+                                        next_name
+                                    ]
+                                    processing_prog = min(next_prog - 1, prog + 1)
+                                    report_progress(
+                                        processing_prog,
+                                        next_step,
+                                        f"{next_step}处理中...",
+                                    )
+                            except Exception:
+                                pass
                     else:
-                        # 尝试从 state_delta 获取步骤信息
                         current_step = state_delta.get("current_step", "处理中")
                         report_progress(
                             min(15 + step_count * 10, 95),
@@ -175,7 +207,7 @@ def run_task(
 
             # --- 5. 任务结束 ---
             print("-" * 50)
-            print(f"✨✨ 全流程执行完毕！ ✨✨")
+            print(f" 全流程执行完毕！ ")
             report_progress(98, "完成", "正在保存最终结果...")
 
             # 获取最终状态以打印 PDF 路径
@@ -188,20 +220,20 @@ def run_task(
                 # 可以在 State 加个 pdf_path 字段，或者去 output 文件夹看。
                 print(f"📂 请前往项目 output/ 目录查看最新生成的 PDF 报告。")
 
-            print(f"💡 提示：保留 ID '{thread_id}'，下次运行时传入可回溯历史。")
+            print(f" 提示：保留 ID '{thread_id}'，下次运行时传入可回溯历史。")
             report_progress(100, "完成", "报告生成成功！")
 
         except KeyboardInterrupt:
             print("\n\n🛑 [System] 用户手动中止任务。")
-            print(f"💾 状态已保存。下次运行 run_task('{thread_id}') 可继续。")
+            print(f" 状态已保存。下次运行 run_task('{thread_id}') 可继续。")
 
         except Exception as e:
-            print(f"\n❌ [System] 运行发生异常: {e}")
+            print(f"\n [System] 运行发生异常: {e}")
             import traceback
 
             traceback.print_exc()
             print(
-                f"\n💾 现场已保护。修复 Bug 后运行 run_task('{thread_id}') 可断点续传。"
+                f"\n 现场已保护。修复 Bug 后运行 run_task('{thread_id}') 可断点续传。"
             )
 
 
@@ -270,14 +302,14 @@ if __name__ == "__main__":
             return d
         d = d.strip()
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
-            print(f"❌ 日期格式错误（应为 YYYY-MM-DD）：{d}")
+            print(f" 日期格式错误（应为 YYYY-MM-DD）：{d}")
             sys.exit(1)
         return d
 
     s_date = _validate_date(s_date)
     e_date = _validate_date(e_date)
 
-    # 🚀 启动！
+    #  启动！
     run_task(
         thread_id=args.id,
         start_date=s_date,

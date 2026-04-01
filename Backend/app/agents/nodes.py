@@ -2,6 +2,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 import concurrent.futures
 from dateutil.relativedelta import relativedelta
+from langchain_openai import ChatOpenAI
 from app.core.logger import logger
 from app.core.config import settings
 
@@ -11,13 +12,14 @@ from app.agents.state import GraphState
 # 2. 引入 ETL 处理器
 from app.etl.event_manager import event_merger
 
-# 3. 引入 Agents
-from app.agents.agent_stats import agent_stats  # Agent A
-from app.agents.agent_opinions import agent_opinions  # Agent B
-from app.agents.agent_compliance import agent_c  # Agent C
-from app.agents.agent_forecast import agent_forecast  # Agent D
-from app.agents.agent_report import agent_report  # Agent E
-from app.agents.tools import get_web_context  # 工具函数
+# 3. 引入业务服务
+from app.services.stats import agent_stats  # Agent A
+from app.services.opinions import agent_opinions  # Agent B
+from app.services.compliance import agent_c  # Agent C
+from app.services.forecast import agent_forecast  # Agent D
+from app.services.historical import agent_historical  # Agent Historical
+from app.services.report import agent_report  # Agent E
+from app.services.utils import get_web_context  # 工具函数
 
 # 4. 引入数据库管理器
 from app.db.mongo_manager import mongo_db
@@ -41,10 +43,10 @@ def classify_node(state: GraphState) -> Dict[str, Any]:
 
     # 如果是综合类别，跳过分类
     if not category or category == "综合":
-        logger.info("\n🏷️ [Node Classify] 综合类别，跳过分类...")
+        logger.info("\n [Node Classify] 综合类别，跳过分类...")
         return {"current_step": "Classify_Skipped"}
 
-    logger.info(f"\n🏷️ [Node Classify] 启动：热搜分类 (目标类别: {category})...")
+    logger.info(f"\n [Node Classify] 启动：热搜分类 (目标类别: {category})...")
 
     if not start_str or not end_str:
         now = datetime.now()
@@ -55,65 +57,70 @@ def classify_node(state: GraphState) -> Dict[str, Any]:
         # 1. 获取原始热搜数据
         raw_items = mongo_db.get_raw_trend_items(start_str, end_str)
         if not raw_items:
-            logger.warning("⚠️ [Node Classify] 无可用数据")
+            logger.warning(" [Node Classify] 无可用数据")
             return {"current_step": "Classify_Empty"}
 
         # 2. 提取所有唯一词条
         all_words = list(
             set(item.get("word") for item in raw_items if item.get("word"))
         )
-        logger.info(f"   📥 [Node Classify] 获取到 {len(all_words)} 个唯一热搜词条")
+        logger.info(f"    [Node Classify] 获取到 {len(all_words)} 个唯一热搜词条")
 
         # 3. 获取已有分类（避免覆盖）
         existing_categories = mongo_db.get_existing_categories(start_str, end_str)
-        logger.info(
-            f"   📌 [Node Classify] 已有 {len(existing_categories)} 个词条有分类"
-        )
+        logger.info(f"    [Node Classify] 已有 {len(existing_categories)} 个词条有分类")
 
         # 4. 并行调用 LLM 分类（跳过已分类的）
         category_map = category_classifier.classify_parallel(
-            words=all_words, max_workers=5, existing_categories=existing_categories
+            words=all_words, max_workers=8, existing_categories=existing_categories
         )
 
         # 5. 回写到数据库
         mongo_db.update_hot_search_categories(category_map, start_str, end_str)
 
-        logger.info(f"✅ [Node Classify] 分类完成，共 {len(category_map)} 个词条")
+        logger.info(f" [Node Classify] 分类完成，共 {len(category_map)} 个词条")
         return {"current_step": "Classify_Done"}
 
     except Exception as e:
-        logger.error(f"❌ [Node Classify] 分类失败: {e}")
+        logger.error(f" [Node Classify] 分类失败: {e}")
         return {"current_step": "Classify_Error"}
 
 
 # =====================================================
-# Node ETL: 数据清洗与归并
+# Node A: 数据准备与选题 (ETL + 热度统计 + 数据抓取)
+# 职责: 完成分析前的全部前置工作，为 B/C 并行分析做好数据准备
 # =====================================================
-def etl_node(state: GraphState) -> Dict[str, Any]:
+def agent_a_node(state: GraphState) -> Dict[str, Any]:
+    FETCH_EVENT_COUNT = 20
+    POSTS_PER_EVENT = 15
+    COMMENTS_PER_POST = 200
+
     category = state.get("category")
     category_label = (
         f"【{category}】" if category and category != "综合" else "【综合】"
     )
-
-    logger.info(f"\n🧹 [Node ETL] 启动：{category_label} 清洗与归并...")
     start_str = state.get("start_date")
     end_str = state.get("end_date")
+
+    logger.info(f"\n [Node A] 启动：{category_label} 数据准备与选题...")
 
     if not start_str or not end_str:
         now = datetime.now()
         end_str = now.strftime("%Y-%m-%d %H:%M:%S")
         start_str = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # -----------------------------------------------------------------
+    # Phase 1: ETL — 数据清洗与归并
+    # -----------------------------------------------------------------
+    logger.info(f"    [A-Phase1] ETL 清洗与归并...")
     try:
-        # 传递 category 参数到 ETL
         events = event_merger.run_merge_task(start_str, end_str, category=category)
         if not events:
-            return {"core_events": [], "current_step": "ETL_Empty"}
+            logger.warning("    [A-Phase1] ETL 无数据")
+            return {"core_events": [], "current_step": "A_ETL_Empty"}
 
-        # 🔥 确保 etl_node 输出的数据是干净的 (无 ObjectId)
         clean_events = []
         for e in events:
-            # 如果是 Pydantic 对象，dump 之；如果是 dict，直接用
             d = e.model_dump() if hasattr(e, "model_dump") else dict(e)
             if "_id" in d and d["_id"]:
                 d["_id"] = str(d["_id"])
@@ -121,75 +128,37 @@ def etl_node(state: GraphState) -> Dict[str, Any]:
                 d["id"] = str(d["id"])
             clean_events.append(d)
 
-        return {"core_events": clean_events, "current_step": "ETL_Done"}
+        logger.info(f"    [A-Phase1] ETL 完成：{len(clean_events)} 个事件")
     except Exception as e:
-        logger.error(f"   ❌ [Node ETL] Error: {e}")
-        return {"core_events": [], "current_step": "ETL_Error"}
+        logger.error(f"    [A-Phase1] ETL 失败: {e}")
+        return {"core_events": [], "current_step": "A_ETL_Error"}
 
-
-# =====================================================
-# Node A: 统计分析
-# =====================================================
-def agent_a_node(state: GraphState) -> Dict[str, Any]:
-    logger.info("\n📊 [Node A] 启动：统计热度...")
+    # -----------------------------------------------------------------
+    # Phase 2: 热度统计与选题 — 从 DB 读取 Top N
+    # -----------------------------------------------------------------
+    logger.info(f"    [A-Phase2] 热度排序选题...")
     result = agent_stats.run(top_n=50)
-    return {"core_events": result.get("core_events", []), "current_step": "A_Done"}
+    core_events = result.get("core_events", [])
 
+    if not core_events:
+        logger.warning("    [A-Phase2] 无有效事件")
+        return {"core_events": [], "current_step": "A_Stats_Empty"}
 
-# =====================================================
-# Node B: 数据提取与深度分析 (B承担"搬运工")
-# 🔥 重构：使用 LLM 判断事件是否重复，确保分析 5 个不同事件
-# =====================================================
-def agent_b_node(state: GraphState) -> Dict[str, Any]:
-    from langchain_openai import ChatOpenAI
-    from langchain_core.prompts import ChatPromptTemplate
-    from app.core.schemas import EventDuplicateCheck
-    from app.core.prompts import EVENT_DUPLICATE_CHECK_PROMPT
+    logger.info(f"    [A-Phase2] 锁定 {len(core_events)} 个核心议题")
 
-    # --- 配置参数 ---
-    FETCH_EVENT_COUNT = 20  # 🔥 前 20 个事件抓取数据 (供合规审查)
-    ANALYZE_EVENT_COUNT = 5  # 🔥 必须分析 5 个不同事件
-    POSTS_PER_EVENT = 15  # 每个事件取 Top 15 帖子
-    COMMENTS_PER_POST = 200  # 每个帖子取 200 条评论
+    # -----------------------------------------------------------------
+    # Phase 3: 并行抓取帖子+评论 — 为 B/C 准备数据
+    # -----------------------------------------------------------------
+    target_events = core_events[:FETCH_EVENT_COUNT]
+    logger.info(f"    [A-Phase3] 并行抓取前 {len(target_events)} 个事件的帖子+评论...")
 
-    logger.info(
-        f"\n🧐 [Node B] 启动：数据提取 (Top {FETCH_EVENT_COUNT}) & 深度分析 (必须 {ANALYZE_EVENT_COUNT} 个不同事件)..."
-    )
-
-    all_events = state.get("core_events", [])
-    if not all_events:
-        return {"analyzed_events": [], "current_step": "B_Skipped"}
-
-    # 仅处理前 N 个事件
-    target_events = all_events[:FETCH_EVENT_COUNT]
-
-    start_date = (state.get("start_date") or "").strip()
-    end_date = (state.get("end_date") or "").strip()
-
-    # -------------------------------------------------------------------------
-    # 初始化去重用的 LLM
-    # -------------------------------------------------------------------------
-    dedup_llm = ChatOpenAI(
-        model=settings.LLM_MODEL,
-        openai_api_key=settings.ZHIPU_API_KEY,
-        openai_api_base=settings.LLM_BASE_URL,
-        temperature=0.1,
-        request_timeout=60,
-        max_retries=2,
-    )
-    structured_dedup_llm = dedup_llm.with_structured_output(EventDuplicateCheck)
-    dedup_prompt = ChatPromptTemplate.from_template(EVENT_DUPLICATE_CHECK_PROMPT)
-
-    # -------------------------------------------------------------------------
-    # 辅助函数：获取单个事件的帖子数据
-    # -------------------------------------------------------------------------
     def fetch_event_posts(event):
-        """只负责抓取数据，不做分析"""
+        """抓取单个事件的帖子和评论数据"""
         try:
             keywords = event.get("related_keywords", [])
             raw_posts = mongo_db.get_posts_by_keywords(keywords, limit=POSTS_PER_EVENT)
-
             valid_posts_data = []
+
             for p in raw_posts or []:
                 note_id = str(p.get("note_id", ""))
                 if not note_id:
@@ -235,7 +204,6 @@ def agent_b_node(state: GraphState) -> Dict[str, Any]:
                     ],
                     "media_context": media_context,
                     "audit_status": p.get("audit_status"),
-                    # 🔥🔥🔥 【新增】保留数据库已有的审核结果 🔥🔥🔥
                     "is_violation": p.get("is_violation"),
                     "violation_info": p.get("violation_info"),
                 }
@@ -243,73 +211,11 @@ def agent_b_node(state: GraphState) -> Dict[str, Any]:
 
             return valid_posts_data
         except Exception as e:
-            logger.error(f"❌ [Node B] 数据抓取失败: {e}")
+            logger.error(f"    [A-Phase3] 数据抓取失败: {e}")
             return []
 
-    # -------------------------------------------------------------------------
-    # 🔥 辅助函数：使用 LLM 检测事件是否与已分析事件重复
-    # -------------------------------------------------------------------------
-    def is_duplicate_event_llm(event_name: str, analyzed_names: list) -> bool:
-        """
-        使用 LLM 判断当前事件是否与已分析的事件是同一新闻事件
-        如"小洛熙"与"小洛熙妈妈"、"马杜罗"与"委内瑞拉局势"
-        """
-        if not analyzed_names:
-            return False
-
-        try:
-            chain = dedup_prompt | structured_dedup_llm
-            result = chain.invoke(
-                {
-                    "current_event": event_name,
-                    "analyzed_events": ", ".join(analyzed_names),
-                }
-            )
-
-            if result and result.is_same_event:
-                logger.info(
-                    f"   ⏭️ [LLM去重] 跳过重复事件: {event_name}\n"
-                    f"      理由: {result.reasoning}"
-                )
-                return True
-            else:
-                logger.info(f"   ✅ [LLM去重] {event_name} 是独立事件")
-                return False
-
-        except Exception as e:
-            logger.warning(f"   ⚠️ [LLM去重] 调用失败，使用规则兜底: {e}")
-            # 兜底：简单规则判断
-            return is_duplicate_event_simple(event_name, analyzed_names)
-
-    def is_duplicate_event_simple(event_name: str, analyzed_names: list) -> bool:
-        """简单规则兜底：字符串包含关系"""
-        if not analyzed_names:
-            return False
-
-        event_name_clean = event_name.strip().replace("#", "")
-
-        for analyzed_name in analyzed_names:
-            analyzed_clean = analyzed_name.strip().replace("#", "")
-
-            # 完全相同
-            if event_name_clean == analyzed_clean:
-                return True
-
-            # 包含关系（且长度差不超过 5）
-            if event_name_clean in analyzed_clean or analyzed_clean in event_name_clean:
-                len_diff = abs(len(event_name_clean) - len(analyzed_clean))
-                if len_diff <= 5:
-                    return True
-
-        return False
-
-    # -------------------------------------------------------------------------
-    # Step 1: 并行抓取所有事件的数据
-    # -------------------------------------------------------------------------
-    logger.info(f"   📥 [Node B] 并行抓取 {len(target_events)} 个事件的数据...")
-
     events_with_data = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_event = {
             executor.submit(fetch_event_posts, evt): evt for evt in target_events
         }
@@ -322,42 +228,124 @@ def agent_b_node(state: GraphState) -> Dict[str, Any]:
                 evt_copy["_fetched_posts"] = posts_data
                 events_with_data.append(evt_copy)
             except Exception as e:
-                logger.error(f"❌ [Node B] 抓取失败: {e}")
+                logger.error(f"    [A-Phase3] 抓取失败: {e}")
                 events_with_data.append(dict(evt))
 
-    # 按原始热度顺序排序
     events_with_data.sort(key=lambda x: x.get("total_heat", 0), reverse=True)
+    final_list = events_with_data + core_events[FETCH_EVENT_COUNT:]
 
-    # -------------------------------------------------------------------------
-    # Step 2: 🔥 串行深度分析 (使用 LLM 去重，确保分析 5 个不同事件)
-    # -------------------------------------------------------------------------
     logger.info(
-        f"   🔍 [Node B] 开始深度分析 (必须 {ANALYZE_EVENT_COUNT} 个不同事件，使用 LLM 去重)..."
+        f" [Node A] 完成：ETL {len(clean_events)} 事件 → "
+        f"选题 {len(core_events)} 个 → "
+        f"抓取 {len(events_with_data)} 个事件数据"
+    )
+    return {"core_events": final_list, "current_step": "A_Done"}
+
+
+# =====================================================
+# Node B-Analyze: 深度舆情分析 (从原 agent_b_node 拆出)
+# 读取 core_events 中的 _fetched_posts 进行深度观点分析
+# 只写 analyzed_events，不影响 core_events
+# =====================================================
+def agent_b_analyze_node(state: GraphState) -> Dict[str, Any]:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+    from app.core.schemas import EventDuplicateCheck
+    from app.core.prompts import EVENT_DUPLICATE_CHECK_PROMPT
+
+    ANALYZE_EVENT_COUNT = 5
+
+    # 读取质量门控反馋（重试时由 retry_counter 写入）
+    feedback = (state.get("supervisor_feedback") or "").strip()
+    retry_count = (state.get("retry_count") or {}).get("agent_b_analyze", 0)
+    is_retry = retry_count > 0
+
+    logger.info(
+        f"\n [Node B-Analyze] 启动：深度分析 (必须 {ANALYZE_EVENT_COUNT} 个不同事件)"
+        f"{f' [第{retry_count}次重试, 反馋: {feedback}]' if is_retry else ''}..."
     )
 
-    analyzed_results = []
-    analyzed_event_names = []  # 记录已分析的事件名，用于去重
+    all_events = state.get("core_events", [])
+    if not all_events:
+        return {"analyzed_events": [], "current_step": "B_Skipped"}
 
-    for evt in events_with_data:
-        # 达到分析数量上限则停止
+    start_date = (state.get("start_date") or "").strip()
+    end_date = (state.get("end_date") or "").strip()
+
+    # 初始化去重用的 LLM
+    dedup_llm = ChatOpenAI(
+        model=settings.LLM_MODEL,
+        openai_api_key=settings.ZHIPU_API_KEY,
+        openai_api_base=settings.LLM_BASE_URL,
+        temperature=0.1,
+        request_timeout=60,
+        max_retries=2,
+    )
+    structured_dedup_llm = dedup_llm.with_structured_output(EventDuplicateCheck)
+    dedup_prompt = ChatPromptTemplate.from_template(EVENT_DUPLICATE_CHECK_PROMPT)
+
+    # -------------------------------------------------------------------------
+    # 辅助函数：LLM 去重
+    # -------------------------------------------------------------------------
+    def is_duplicate_event_llm(event_name: str, analyzed_names: list) -> bool:
+        if not analyzed_names:
+            return False
+        try:
+            chain = dedup_prompt | structured_dedup_llm
+            result = chain.invoke(
+                {
+                    "current_event": event_name,
+                    "analyzed_events": ", ".join(analyzed_names),
+                }
+            )
+            if result and result.is_same_event:
+                logger.info(
+                    f"    [LLM去重] 跳过重复事件: {event_name}\n"
+                    f"      理由: {result.reasoning}"
+                )
+                return True
+            else:
+                logger.info(f"    [LLM去重] {event_name} 是独立事件")
+                return False
+        except Exception as e:
+            logger.warning(f"    [LLM去重] 调用失败，使用规则兜底: {e}")
+            return is_duplicate_event_simple(event_name, analyzed_names)
+
+    def is_duplicate_event_simple(event_name: str, analyzed_names: list) -> bool:
+        if not analyzed_names:
+            return False
+        event_name_clean = event_name.strip().replace("#", "")
+        for analyzed_name in analyzed_names:
+            analyzed_clean = analyzed_name.strip().replace("#", "")
+            if event_name_clean == analyzed_clean:
+                return True
+            if event_name_clean in analyzed_clean or analyzed_clean in event_name_clean:
+                if abs(len(event_name_clean) - len(analyzed_clean)) <= 5:
+                    return True
+        return False
+
+    # -------------------------------------------------------------------------
+    # 串行深度分析 (LLM 去重 + 确保 5 个不同事件)
+    # -------------------------------------------------------------------------
+    analyzed_results = []
+    analyzed_event_names = []
+
+    for evt in all_events:
         if len(analyzed_results) >= ANALYZE_EVENT_COUNT:
             break
 
         event_name = evt.get("event_name", "未知")
         posts_data = evt.get("_fetched_posts", [])
 
-        # 检查是否有数据
         if not posts_data:
-            logger.info(f"   ⏭️ [Node B] 跳过无数据事件: {event_name}")
+            logger.info(f"    [B-Analyze] 跳过无数据事件: {event_name}")
             continue
 
-        # 🔥 使用 LLM 检查是否与已分析事件重复
         if is_duplicate_event_llm(event_name, analyzed_event_names):
             continue
 
-        # 执行深度分析
         logger.info(
-            f"   🔍 [Node B] 深度分析: 《{event_name}》 ({len(analyzed_results)+1}/{ANALYZE_EVENT_COUNT})..."
+            f"    [B-Analyze] 深度分析: 《{event_name}》 ({len(analyzed_results)+1}/{ANALYZE_EVENT_COUNT})..."
         )
 
         try:
@@ -375,27 +363,22 @@ def agent_b_node(state: GraphState) -> Dict[str, Any]:
                 analysis_input,
                 start_date=start_date,
                 end_date=end_date,
+                improvement_hint=feedback if is_retry else "",
             )
 
             if analyzed_res:
                 evt["opinion_report"] = analyzed_res
                 analyzed_results.append(evt)
                 analyzed_event_names.append(event_name)
-                logger.info(f"   ✅ [Node B] 完成分析: 《{event_name}》")
+                logger.info(f"    [B-Analyze] 完成分析: 《{event_name}》")
 
         except Exception as e:
-            logger.error(f"❌ [Node B] 分析失败 ({event_name}): {e}")
+            logger.error(f" [B-Analyze] 分析失败 ({event_name}): {e}")
 
-    # 合并剩余未处理的事件
-    final_list = events_with_data + all_events[FETCH_EVENT_COUNT:]
-
-    logger.info(
-        f"✅ [Node B] 完成。处理了 {len(events_with_data)} 个事件，深度分析 {len(analyzed_results)} 个。"
-    )
+    logger.info(f" [B-Analyze] 完成：深度分析了 {len(analyzed_results)} 个事件。")
 
     return {
-        "core_events": final_list,  # 更新带数据和报告的完整列表
-        "analyzed_events": analyzed_results,  # 只含被深度分析的
+        "analyzed_events": analyzed_results,
         "current_step": "B_Done",
     }
 
@@ -404,7 +387,14 @@ def agent_b_node(state: GraphState) -> Dict[str, Any]:
 # Node C: 合规审查 (Batch 模式 - 完美版)
 # =====================================================
 def agent_c_node(state: GraphState) -> Dict[str, Any]:
-    logger.info("\n👮 [Node C] 启动：批量合规审查 (复用 B 的全量 200 条数据)...")
+    feedback = (state.get("supervisor_feedback") or "").strip()
+    retry_count = (state.get("retry_count") or {}).get("agent_c", 0)
+    if retry_count > 0:
+        logger.info(
+            f"\n [Node C] 启动：批量合规审查 [第{retry_count}次重试, 反馋: {feedback}]..."
+        )
+    else:
+        logger.info("\n [Node C] 启动：批量合规审查 (复用 B 的全量 200 条数据)...")
 
     events_with_data = state.get("core_events", [])
     target_events = events_with_data[:10]
@@ -414,7 +404,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     def process_single_audit_task(p, event_name):
         try:
-            # 🔥🔥🔥 【修改】处理已审核过的帖子 🔥🔥🔥
+            #  【修改】处理已审核过的帖子
             if not settings.FORCE_AUDIT_UPDATE and p.get("audit_status") == "completed":
                 # 如果数据库里已经是违规状态，我们需要把它加回本次报告中
                 if p.get("is_violation") is True:
@@ -443,7 +433,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                 ]
             )
 
-            # ✅ Batch + RAG：一次审查 + 标签检索法规 + 证据链
+            #  Batch + RAG：一次审查 + 标签检索法规 + 证据链
             rag_payload = agent_c.batch_audit_with_rag(
                 post_content=p["content"],
                 comments_text=comments_text_block,
@@ -454,6 +444,9 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
             batch_res = rag_payload.get("batch_result", {})
             matched_laws = rag_payload.get("matched_laws", [])
             evidence_report = rag_payload.get("evidence_report", {})
+
+            # 简化模式审查结果直接视为安全
+            # （无需特殊标记，正常流程处理）
 
             # 统一写回结构
             violation_info = {
@@ -477,7 +470,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                 "violated_comments": batch_res.get("violated_comments") or [],
             }
         except Exception as e:
-            logger.error(f"❌ [Node C] 帖子审核失败 ({p.get('note_id')}): {e}")
+            logger.error(f" [Node C] 帖子审核失败 ({p.get('note_id')}): {e}")
             return None
 
     # -------------------------------------------------------------------------
@@ -503,7 +496,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     post_audit_updates = []
     comment_audit_updates = []
 
-    # 同样控制并发数，Agent C 比较耗费 token 和计算，建议适中 (例如 5-8)
+    # 同样控制并发数，Agent C 比较耗费 token 和计算，建议适中 (例如 3)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [
             executor.submit(process_single_audit_task, p, ename) for p, ename in tasks
@@ -570,7 +563,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
 
             # C. 记录违规结果到 state
             if is_violation:
-                # 🔥 重构：保存原始帖子内容和违规评论原文，用于报告展示
+                #  重构：保存原始帖子内容和违规评论原文，用于报告展示
                 violated_comment_texts = []
                 for v_item in violated_comments:
                     try:
@@ -595,7 +588,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                         "db_id": p["db_id"],
                         "is_violation": True,
                         "violation_info": violation_info,
-                        # 🔥 新增：保存原始内容
+                        #  新增：保存原始内容
                         "post_content": p.get("content", ""),  # 帖子原文
                         "violated_comment_originals": violated_comment_texts,  # 违规评论原文
                     }
@@ -606,163 +599,217 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
         try:
             mongo_db.update_post_audit(post_audit_updates)
             logger.info(
-                f"   ✅ [Node C] 已更新 {len(post_audit_updates)} 条帖子的审核状态。"
+                f"    [Node C] 已更新 {len(post_audit_updates)} 条帖子的审核状态。"
             )
         except Exception as e:
-            logger.error(f"   ⚠️ [Node C] 回写帖子审核结果失败: {e}")
+            logger.error(f"    [Node C] 回写帖子审核结果失败: {e}")
 
     # 批量回写（评论粒度，仅违规项）
     if comment_audit_updates:
         try:
             mongo_db.update_comment_audit(comment_audit_updates)
             logger.info(
-                f"   ✅ [Node C] 已更新 {len(comment_audit_updates)} 条评论的审核状态。"
+                f"    [Node C] 已更新 {len(comment_audit_updates)} 条评论的审核状态。"
             )
         except Exception as e:
-            logger.error(f"   ⚠️ [Node C] 回写评论审核结果失败: {e}")
+            logger.error(f"    [Node C] 回写评论审核结果失败: {e}")
 
     return {"audit_results": audit_results, "current_step": "C_Done"}
 
 
 # =====================================================
-# Node D: 趋势预测
+# Node Historical: 历史同期热门事件回顾
+# =====================================================
+def agent_historical_node(state: GraphState) -> Dict[str, Any]:
+    """
+    搜索去年同月每天的代表性热点事件
+    """
+    logger.info("\n [Node Historical] 启动：历史同期热门事件回顾...")
+
+    end_date = state.get("end_date")
+    if not end_date:
+        logger.warning(" [Node Historical] 缺少结束日期，跳过历史回顾")
+        return {"historical_events": None, "current_step": "Historical_Skipped"}
+
+    try:
+        result = agent_historical.analyze(end_date)
+        return result
+    except Exception as e:
+        logger.error(f" [Node Historical] 执行失败: {e}")
+        return {"historical_events": None, "current_step": "Historical_Error"}
+
+
+# =====================================================
+# Node D: 趋势预测 (ReAct Agent 模式)
 # =====================================================
 def agent_d_node(state: GraphState) -> Dict[str, Any]:
-    logger.info("\n🔮 [Node D] 启动：趋势研判...")
+    """
+    Agent D: 趋势预测 (ReAct Agent 模式)
+
+    Agent 自主构造搜索词，但 Prompt 约束时间与领域格式
+    """
+    from app.agents.factory import create_agent
+    from app.services.utils import tavily_search
+    from app.core.prompts import AGENT_D_REACT_SYSTEM_PROMPT
+    from langchain_core.messages import HumanMessage
+    import re
+    import json as json_module
+
+    feedback = (state.get("supervisor_feedback") or "").strip()
+    retry_count = (state.get("retry_count") or {}).get("agent_d", 0)
+    is_retry = retry_count > 0
+
+    logger.info(
+        f"\n [Node D] 启动：趋势研判 (ReAct Mode)"
+        f"{f' [第{retry_count}次重试, 反馈: {feedback}]' if is_retry else ''}..."
+    )
+
+    # ----------------------------------------------------------------
+    # 公共数据准备
+    # ----------------------------------------------------------------
     analyzed_events = state.get("analyzed_events", [])
     audit_results = state.get("audit_results", [])
-    category = state.get("category") or "综合"  # 新增对于类别准确预测
+    category = state.get("category") or "综合"
+    forecast_range = state.get("forecast_range") or "1m"
 
+    # 准备当前舆情摘要
     b_texts = []
     for evt in analyzed_events:
         r = evt.get("opinion_report", {})
         if isinstance(r, dict):
             b_texts.append(
-                f"【事件】{evt.get('event_name')}\n【概况】{r.get('event_overview')}\n【观点】{r.get('public_opinions')}"
+                f"【事件】{evt.get('event_name')}\n【概况】{r.get('event_overview')}"
             )
     opinion_str = "\n---\n".join(b_texts) if b_texts else "无数据"
 
     c_texts = []
     for r in audit_results:
         v = r.get("violation_info", {})
-
-        # 🔥 升级：提取违规标签摘要，辅助趋势研判
-        cats = set()
-        for item in v.get("violated_comments") or []:
-            if item.get("category"):
-                cats.add(item.get("category"))
-
-        cat_info = f" | 涉及: {', '.join(cats)}" if cats else ""
-
         c_texts.append(
-            f"事件<{r.get('event_name','未知')}>: 风险[{v.get('overall_risk_level')}]{cat_info}"
+            f"事件<{r.get('event_name','未知')}>: 风险[{v.get('overall_risk_level')}]"
         )
     audit_str = "\n".join(c_texts) if c_texts else "无高风险"
 
-    # --- 🔥 新增：Node 层显式执行搜索逻辑 (符合架构设计) ---
-    # 0. 获取用户指定的预测范围 (从 state 读取)
-    forecast_range = state.get("forecast_range") or "1m"
-
+    # ----------------------------------------------------------------
+    # 计算目标时间段描述
+    # ----------------------------------------------------------------
     range_map = {
-        "1w": (7, "days"),
-        "2w": (14, "days"),
-        "1m": (1, "months"),
-        "2m": (2, "months"),
+        "1w": ("未来一周", 7, "days"),
+        "2w": ("未来两周", 14, "days"),
+        "1m": ("未来一个月", 1, "months"),
+        "2m": ("未来两个月", 2, "months"),
     }
-    delta_val, delta_unit = range_map.get(forecast_range, (1, "months"))
+    range_desc, delta_val, delta_unit = range_map.get(
+        forecast_range, ("未来一个月", 1, "months")
+    )
     now = datetime.now()
 
-    # 🔥 定义领域限定词 (关键修改)
-    if category in ["综合", "其他"] or not category:
-        domain_kw = ""  # 通用搜索
-        domain_desc = "全网"
-    else:
-        domain_kw = f"{category}领域"  # 例如：高校领域、科技领域
-        domain_desc = f"{category}行业"
-
     if delta_unit == "days":
-        # ==========================================
-        # 🟢 场景 A：短期预测 (未来 1-2 周)
-        # ==========================================
-        # 1. 锁定具体日期区间（从今天到未来 N 天）
-        end_date = now + timedelta(days=delta_val)
-        time_period_desc = f"{now.strftime('%Y年%m月%d日')}至{end_date.strftime('%Y年%m月%d日')}（未来{delta_val}天）"
-
-        # 2. 计算“旬”以精确匹配历史规律（保留原有旬判断供参考）
-        day_num = now.day
-        if day_num <= 10:
-            period_mark = "上旬"
-        elif day_num <= 20:
-            period_mark = "中旬"
-        else:
-            period_mark = "下旬"
-
-        # 3. 搜历史：使用明确的日期区间作为匹配条件，便于检索历年同期案例（包含 domain_kw）
-        query_history = (
-            f"历年{now.month}月{now.day}日~{end_date.month}月{end_date.day}日 中国{domain_kw}重点、热门网络舆情 高发事件 复盘 "
-            f"历年{now.month}月{now.day}日~{end_date.month}月{end_date.day}日 {domain_kw}典型舆情案例"
-        )
-
-        # 4. 搜未来：明确描述未来时间段与领域，聚焦未来N天内的政策/日历与风险前瞻
-        query_future = (
-            f"{now.year}年{now.month}月{now.day}日 至 {end_date.year}年{end_date.month}月{end_date.day}日 {domain_kw}重点新闻日历 大事预告 "
-            f"未来{delta_val}天 中国{domain_kw}舆情 风险点前瞻"
-        )
-
+        target_date = now + timedelta(days=delta_val)
     else:
-        # ==========================================
-        # 🔵 场景 B：中长期预测 (未来 1-2 个月)
-        # ==========================================
-        # 1. 锁定目标结束日期（从今天到未来N个月的同一日期）
         target_date = now + relativedelta(months=delta_val)
-        target_year = target_date.year
-        target_month = target_date.month
 
-        time_period_desc = f"{now.strftime('%Y年%m月%d日')}至{target_date.strftime('%Y年%m月%d日')}（未来{delta_val}个月）"
+    target_period = f"{now.strftime('%Y年%m月%d日')}至{target_date.strftime('%Y年%m月%d日')}（{range_desc}）"
 
-        # 2. 搜历史：使用跨月/跨日的日期区间，检索历年同期案例（包含 domain_kw）
-        query_history = (
-            f"历年{now.month}月{now.day}日~{target_date.month}月{target_date.day}日 中国{domain_kw}重点、热门网络舆情 高发领域 复盘 "
-            f"历年{now.month}月{now.day}日~{target_date.month}月{target_date.day}日 {domain_kw}典型舆情案例"
-        )
+    logger.info(f"   🌍 [Node D] 研判周期: {target_period}, 领域: {category}")
 
-        # 3. 搜未来：强调未来数月内的日历事件与趋势预测
-        query_future = (
-            f"未来{delta_val}个月 中国{domain_kw}重点新闻日历 大事预告 "
-            f"未来{delta_val}个月 中国{domain_kw}舆情 风险点前瞻 "
-            f"{target_year}年{target_month}月 {domain_kw}政策施行 发展趋势前瞻"
-        )
-    logger.info(
-        f"   🌍 [Node D] 正在调取全网{domain_desc}情报库 (研判周期: {time_period_desc})..."
+    # ----------------------------------------------------------------
+    # 创建 ReAct Agent
+    # ----------------------------------------------------------------
+    llm = ChatOpenAI(
+        model=settings.LLM_MODEL,
+        openai_api_key=settings.ZHIPU_API_KEY,
+        openai_api_base=settings.LLM_BASE_URL,
+        temperature=0.6,
+        request_timeout=180,
+        max_retries=3,
     )
 
-    # --- 优化结束 ---
-
-    # 执行搜索
-    history_context = get_web_context(query_history)
-    future_context = get_web_context(query_future)
-
-    # 4. 调用 Agent D (必须传递 time_period_desc)
-    forecast = agent_forecast.run(
-        current_opinion_analysis=opinion_str,
-        audit_risks=audit_str,
-        history_context=history_context,
-        future_context=future_context,
-        forecast_range=forecast_range,
-        time_period_desc=time_period_desc,  # 🔥 关键：告诉 LLM 它到底在预测哪几天
-        category=category,  # 新增对于类别准确预测
+    system_prompt = AGENT_D_REACT_SYSTEM_PROMPT.format(
+        target_period=target_period,
+        category=category,
+        current_date=now.strftime("%Y年%m月%d日"),
     )
+
+    agent = create_agent(
+        model=llm,
+        tools=[tavily_search],
+        system_prompt=system_prompt,
+    )
+
+    # ----------------------------------------------------------------
+    # 执行 Agent
+    # ----------------------------------------------------------------
+    user_message = f"""
+请为【{category}领域】的【{target_period}】进行舆情风险预测。
+
+当前舆论情绪摘要：
+{opinion_str}
+
+已核实违规风险：
+{audit_str}
+
+{'【改进建议】' + feedback if is_retry else ''}
+"""
+
+    try:
+        # 添加 recursion_limit 防止无限循环
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=user_message)]}, {"recursion_limit": 10}
+        )
+
+        # 从最后一条消息提取 JSON
+        last_message = result["messages"][-1]
+        forecast = _extract_json_from_agent_message(last_message.content)
+
+        # 确保 target_period 有值
+        if not forecast.get("target_period"):
+            forecast["target_period"] = target_period
+
+        logger.info(
+            f"   [Node D] ReAct Agent 完成，生成 {len(forecast.get('topics', []))} 个预测主题"
+        )
+
+    except Exception as e:
+        logger.error(f"[Node D] ReAct Agent 执行失败: {e}")
+        # 降级：返回空预测结构，标记错误以便 quality_gate 判断
+        forecast = {"target_period": target_period, "topics": [], "_error": str(e)}
+
     return {"trend_forecast": forecast, "current_step": "D_Done"}
+
+
+def _extract_json_from_agent_message(content: str) -> dict:
+    """从 Agent 输出中提取 JSON"""
+    import re
+    import json
+
+    # 尝试匹配 JSON 代码块
+    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except:
+            pass
+
+    # 尝试匹配裸 JSON 对象
+    obj_match = re.search(r"\{[\s\S]*\}", content)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group())
+        except:
+            pass
+
+    # 兜底返回空结构
+    return {"target_period": "", "topics": []}
 
 
 # =====================================================
 # Node E: 报告总编
 # =====================================================
-from datetime import datetime
 
 
 def agent_e_node(state: GraphState) -> Dict[str, Any]:
-    logger.info("\n📝 [Node E] 启动：生成 PDF...")
+    logger.info("\n [Node E] 启动：生成 PDF...")
     output = agent_report.generate_full_report(state)
 
     # --- 持久化到长期记忆 (Mongo report_sessions) ---
@@ -771,16 +818,20 @@ def agent_e_node(state: GraphState) -> Dict[str, Any]:
             "task_id": state.get("task_id"),
             "created_at": datetime.now(),
             "category": state.get("category", "综合"),
-            "pdf_path": output.get("pdf_path", ""),
+            "md_path": output.get("md_path", ""),
             "report_markdown": output.get("markdown", ""),
             "trend_forecast": state.get("trend_forecast", {}),
             "core_events": state.get("core_events", []),
             "violation_stats": output.get("violation_stats", {}),
         }
         mongo_db.save_report_session(session_data)
-        logger.info("💾 [Memory] 报告已存入长期记忆 (report_sessions)")
+        logger.info(" [Memory] 报告已存入长期记忆 (report_sessions)")
     except Exception as e:
-        logger.error(f"⚠️ [Node E] 保存报告到长期记忆失败: {e}")
+        logger.error(f" [Node E] 保存报告到长期记忆失败: {e}")
 
-    logger.info(f"📄 PDF: {output.get('pdf_path')}")
-    return {"final_report": output.get("markdown", ""), "current_step": "E_Done"}
+    logger.info(f" 报告文件: {output.get('md_path')}")
+    return {
+        "final_report": output.get("markdown", ""),
+        "violation_stats": output.get("violation_stats", {}),
+        "current_step": "E_Done",
+    }

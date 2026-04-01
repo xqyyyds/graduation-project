@@ -29,7 +29,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from main import run_task
 
-# 🔥 新增导入 mongo_db，用于获取违规统计
+#  新增导入 mongo_db，用于获取违规统计
 from app.db.mongo_manager import mongo_db
 
 app = FastAPI(
@@ -165,7 +165,7 @@ class DashboardStats(BaseModel):
     reports_today: int
     reports_this_week: int
     category_distribution: dict
-    # 🔥 新增字段：违规统计分布
+    #  新增字段：违规统计分布
     violation_distribution: dict
     recent_reports: List[ReportSummary]
 
@@ -203,7 +203,7 @@ async def execute_task(task_id: str, params: TaskCreate):
             # 记录任务启动时间（毫秒）用于前端计时与回放
             "start_time": int(datetime.now().timestamp() * 1000),
         }
-        add_system_log("INFO", f"🚀 任务 {task_id} 开始执行")
+        add_system_log("INFO", f" 任务 {task_id} 开始执行")
 
         # 定义进度回调函数
         def progress_callback(progress: int, step: str, message: str):
@@ -246,7 +246,7 @@ async def execute_task(task_id: str, params: TaskCreate):
             }
         )
         task_store[task_id] = existing
-        add_system_log("INFO", f"✅ 任务 {task_id} 执行完成")
+        add_system_log("INFO", f" 任务 {task_id} 执行完成")
     except Exception as e:
         existing = dict(task_store.get(task_id, {}))
         existing.update(
@@ -259,7 +259,7 @@ async def execute_task(task_id: str, params: TaskCreate):
             }
         )
         task_store[task_id] = existing
-        add_system_log("ERROR", f"❌ 任务 {task_id} 执行失败: {str(e)}")
+        add_system_log("ERROR", f" 任务 {task_id} 执行失败: {str(e)}")
 
 
 # =====================================================
@@ -357,7 +357,7 @@ async def get_dashboard_stats():
         cat = r.category
         category_dist[cat] = category_dist.get(cat, 0) + 1
 
-    # 2. 🔥 调用 MongoDB 聚合查询获取违规统计 (条形图数据)
+    # 2.  调用 MongoDB 聚合查询获取违规统计 (条形图数据)
     violation_dist = mongo_db.get_dashboard_violation_stats()
 
     return DashboardStats(
@@ -365,7 +365,7 @@ async def get_dashboard_stats():
         reports_today=reports_today,
         reports_this_week=reports_this_week,
         category_distribution=category_dist,
-        violation_distribution=violation_dist,  # 🔥 返回聚合结果
+        violation_distribution=violation_dist,  #  返回聚合结果
         recent_reports=reports[:10],  # 显示更多报告
     )
 
@@ -633,32 +633,24 @@ async def test_llm_connection(params: LLMTestParams):
         f"LLM 测试请求: model={model}, base_url={'(present)' if base_url else '(none)'}, api_key_present={'yes' if api_key else 'no'}"
     )
 
-    # 1) 尝试使用 openai SDK 发起最小化请求以捕获常见错误
+    # 1) 尝试使用 openai SDK (v1.x+) 发起最小化请求以捕获常见错误
     openai_err = None
     try:
-        import openai
+        from openai import OpenAI
 
-        if api_key:
-            openai.api_key = api_key
-        if base_url:
-            openai.api_base = base_url.rstrip("/")
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url.rstrip("/") if base_url else None,
+        )
 
-        resp = openai.ChatCompletion.create(
+        resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "请回复：连接成功。"}],
             max_tokens=10,
             temperature=0,
         )
 
-        content = None
-        if isinstance(resp, dict) and resp.get("choices"):
-            content = (
-                resp["choices"][0]["message"]["content"]
-                if resp["choices"][0].get("message")
-                else str(resp)
-            )
-        else:
-            content = str(resp)
+        content = resp.choices[0].message.content if resp.choices else str(resp)
 
         low = (content or "").lower()
         if "连接成功" in low or "success" in low or "ok" in low:

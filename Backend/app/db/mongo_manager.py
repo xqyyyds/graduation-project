@@ -78,9 +78,9 @@ class MongoManager:
         try:
             self.client = MongoClient(settings.MONGO_URI)
             self.db = self.client[settings.MONGO_DB_NAME]
-            logger.info("✅ MongoDB 连接成功。")
+            logger.info(" MongoDB 连接成功。")
         except Exception as e:
-            logger.error(f"❌ MongoDB 连接失败: {e}")
+            logger.error(f" MongoDB 连接失败: {e}")
             raise e
 
     def get_collection(self, collection_name: str):
@@ -118,7 +118,7 @@ class MongoManager:
             delta_days = (d2.date() - d1.date()).days + 1  # 包含结束日期
             if delta_days <= 0:
                 logger.warning(
-                    "⚠️ 结束日期必须大于或等于开始日期，默认返回最近一天的数据。"
+                    " 结束日期必须大于或等于开始日期，默认返回最近一天的数据。"
                 )
                 delta_days = 1
 
@@ -133,7 +133,7 @@ class MongoManager:
                 f"ℹ️ 查询日期范围: {d1.isoformat(sep=' ')} 至 {d2.isoformat(sep=' ')}, 计划使用{limit}个热搜快照."
             )
         except Exception as e:
-            logger.error(f"❌ [ETL] 日期解析错误: {e}")
+            logger.error(f" [ETL] 日期解析错误: {e}")
             return []
 
         # 以空格分隔的 ISO 格式生成，与数据库中现有时间格式保持一致
@@ -149,7 +149,7 @@ class MongoManager:
             .limit(limit)
         )
         results = list(cursor)
-        logger.info(f"✅ 获取到 {len(results)} 条热搜快照数据。")
+        logger.info(f" 获取到 {len(results)} 条热搜快照数据。")
         return results
 
     def get_raw_trend_items(self, start_date: str, end_date: str) -> List[Dict]:
@@ -203,7 +203,7 @@ class MongoManager:
         :param end_date: 结束日期
         """
         if not category_map:
-            logger.warning("⚠️ 无分类数据可更新")
+            logger.warning(" 无分类数据可更新")
             return
 
         # 获取日期范围内的快照
@@ -240,7 +240,7 @@ class MongoManager:
         if operations:
             result = self.db["hot_trends_history"].bulk_write(operations)
             logger.info(
-                f"✅ [分类回写] 已更新 {result.modified_count} 个快照，共 {updated_count} 个词条分类"
+                f" [分类回写] 已更新 {result.modified_count} 个快照，共 {updated_count} 个词条分类"
             )
 
     def save_core_events(self, events: List[Dict]):
@@ -248,11 +248,11 @@ class MongoManager:
         保存清洗后的热度TOP事件到'events'集合
         """
         if not events:
-            logger.warning("⚠️ 无事件数据可保存。")
+            logger.warning(" 无事件数据可保存。")
             return
         self.db["events"].delete_many({})
         self.db["events"].insert_many(events)
-        logger.info(f"✅ 已保存 {len(events)} 条核心事件数据到 'events' 集合。")
+        logger.info(f" 已保存 {len(events)} 条核心事件数据到 'events' 集合。")
 
     def get_top_events(self, events: List[Dict], top_n: int = 10) -> List[Dict]:
         """
@@ -272,12 +272,12 @@ class MongoManager:
         逻辑：只要帖子的source_keyword在这个事件的关键词列表里，就是这个事件的帖子
         """
         if not keywords:
-            logger.warning("⚠️ 关键词列表为空，无法查询帖子。")
+            logger.warning(" 关键词列表为空，无法查询帖子。")
             return []
 
         query = {"source_keyword": {"$in": keywords}}
         # 按点赞数倒序，取最热的帖子
-        # 🔥 修正：使用 collation 做数值排序，解决字符串 "10" < "2" 的问题
+        #  修正：使用 collation 做数值排序，解决字符串 "10" < "2" 的问题
         try:
             return list(
                 self.db["weibo_contents"]
@@ -288,7 +288,7 @@ class MongoManager:
             )
         except Exception as e:
             # 万一 DB 版本过低不支持 collation，降级为普通查询
-            logger.warning(f"⚠️ [MongoDB] Collation 排序失败，降级为普通排序: {e}")
+            logger.warning(f" [MongoDB] Collation 排序失败，降级为普通排序: {e}")
             return list(
                 self.db["weibo_contents"]
                 .find(query)
@@ -301,16 +301,16 @@ class MongoManager:
     ) -> List[Dict]:
         """
         根据帖子 note_id 列表，获取对应的评论数据。
-        🔥 修改点：按 'comment_like_count' 倒序排列，优先获取高赞评论。
+         修改点：按 'comment_like_count' 倒序排列，优先获取高赞评论。
         """
         if not note_ids:
-            logger.warning("⚠️ 帖子 note_id 列表为空，无法查询评论。")
+            logger.warning(" 帖子 note_id 列表为空，无法查询评论。")
             return []
 
         query = {"note_id": {"$in": note_ids}}
 
         # 这里加上 sort，确保 Agent B 分析的是热门观点
-        # 🔥 修正：使用 collation 做数值排序
+        #  修正：使用 collation 做数值排序
         try:
             return list(
                 self.db["weibo_comments"]
@@ -320,7 +320,7 @@ class MongoManager:
                 .limit(limit)
             )
         except Exception as e:
-            logger.warning(f"⚠️ [MongoDB] Collation 排序失败，降级为普通排序: {e}")
+            logger.warning(f" [MongoDB] Collation 排序失败，降级为普通排序: {e}")
             return list(
                 self.db["weibo_comments"]
                 .find(query)
@@ -330,7 +330,7 @@ class MongoManager:
 
     def get_pending_posts(self, batch_size: int = 50) -> List[Dict]:
         """
-        🔥 新增：获取需要审核的帖子（即还没有 'audit_status' 字段，或状态不是 'completed' 的）
+         新增：获取需要审核的帖子（即还没有 'audit_status' 字段，或状态不是 'completed' 的）
         用于断点续传，每次只捞没处理过的。
         """
         query = {
@@ -407,7 +407,7 @@ class MongoManager:
         )
 
     # ------------------------------------------------------------------
-    # 🔥 新增：从 report_sessions 聚合全局违规统计
+    #  新增：从 report_sessions 聚合全局违规统计
     # ------------------------------------------------------------------
     def get_dashboard_violation_stats(self) -> Dict[str, int]:
         """
@@ -422,7 +422,7 @@ class MongoManager:
             )
             sessions = list(cursor)
             if not sessions:
-                logger.info("📊 [MongoDB] 未找到 report_sessions，返回空统计")
+                logger.info(" [MongoDB] 未找到 report_sessions，返回空统计")
                 return {}
 
             latest = sessions[0]
@@ -434,14 +434,14 @@ class MongoManager:
 
             if not isinstance(stats, dict):
                 logger.warning(
-                    "📊 [MongoDB] 最新 report_sessions 中的 violation_stats 非字典类型，返回空统计"
+                    " [MongoDB] 最新 report_sessions 中的 violation_stats 非字典类型，返回空统计"
                 )
                 return {}
 
-            logger.info(f"📊 [MongoDB] 获取最新报告违规统计，覆盖 {len(stats)} 个类别")
+            logger.info(f" [MongoDB] 获取最新报告违规统计，覆盖 {len(stats)} 个类别")
             return stats
         except Exception as e:
-            logger.error(f"❌ [MongoDB] 读取最新报告违规统计失败: {e}")
+            logger.error(f" [MongoDB] 读取最新报告违规统计失败: {e}")
             return {}
 
 

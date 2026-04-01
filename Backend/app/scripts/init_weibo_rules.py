@@ -508,7 +508,7 @@ WEIBO_RULES_DATA = [
 
 def init_weibo_rules():
     logger.info(
-        f"🚀 正在全量初始化《微博投诉操作细则》，共准备了 {len(WEIBO_RULES_DATA)} 条核心规则..."
+        f" 正在全量初始化《微博投诉操作细则》，共准备了 {len(WEIBO_RULES_DATA)} 条核心规则..."
     )
 
     docs = []
@@ -534,14 +534,14 @@ def init_weibo_rules():
 
     # 3. 写入 ChromaDB
     if docs:
-        logger.info(f"💾 正在将数据写入向量数据库...")
+        logger.info(f" 正在将数据写入向量数据库...")
         chroma_db.add_documents(docs)
-        logger.info("✅ 全量入库完成！你的 Agent C 现在熟读了整本微博管理细则。")
+        logger.info(" 全量入库完成！你的 Agent C 现在熟读了整本微博管理细则。")
 
 
 if __name__ == "__main__":
     # 为了保证数据不重复，建议先清空一次
-    logger.warning("⚠️ 正在清空旧数据...")
+    logger.warning(" 正在清空旧数据...")
     chroma_db.clear_db()
 
     init_weibo_rules()

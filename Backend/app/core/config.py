@@ -1,18 +1,19 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# 让 .env 文件的值优先于系统环境变量
+load_dotenv(override=True)
 
 
 class Settings:
     # llm设置
-    # 🔥 全局切换为 ZetaTechs GPT-4o-mini
+    #  切换为火山引擎 DeepSeek-V3
     ZHIPU_API_KEY: str = os.getenv(
-        "ZHIPU_API_KEY", "sk-y170uJo6PLCyB4zCDRZGEJhZVeVDi4gaKYVBMtQDg0ve4zey"
+        "ZHIPU_API_KEY", "bad91148-3e61-4cb2-9615-3b838333849c"
     )
-    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    # 智谱 OpenAI-compat base url -> 现在指向 ZetaTechs
-    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.zetatechs.com/v1")
+    LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v3-2-251201")
+    # 火山引擎 Ark OpenAI-compat base url
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 
     # embedding设置
     BAAI_API_KEY = os.getenv("BAAI_API_KEY", "")
@@ -40,7 +41,7 @@ class Settings:
     # Tavily设置
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
-    # 🔥 调试开关：强制覆盖审核结果 (即使已审核过也重新审)
+    #  调试开关：强制覆盖审核结果 (即使已审核过也重新审)
     FORCE_AUDIT_UPDATE: bool = os.getenv("FORCE_AUDIT_UPDATE", "True").lower() == "true"
 
 

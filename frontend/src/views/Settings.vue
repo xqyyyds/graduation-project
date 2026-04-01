@@ -108,7 +108,7 @@
           <el-form-item label="API Base URL">
             <el-input
               v-model="llmForm.baseUrl"
-              placeholder="https://api.openai.com/v1"
+              placeholder="https://api.zetatechs.com/v1"
             >
               <template #prefix><el-icon><Link /></el-icon></template>
             </el-input>
