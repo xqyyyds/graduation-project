@@ -1,335 +1,347 @@
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 import concurrent.futures
 
-# LangChain 组件
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-# from langchain_core.output_parsers import JsonOutputParser (已弃用，改用 with_structured_output)
-
-# 引入配置
-from app.core.config import settings
+from app.core.llm_factory import get_main_llm
 from app.core.logger import logger
-
-#  引入升级后的 Schema 和 Prompts
-from app.core.schemas import PostOpinionSummary, EventAnalysisReport
 from app.core.prompts import AGENT_B_MAP_TEMPLATE, AGENT_B_REDUCE_TEMPLATE
-
-# 引入联网搜索工具
+from app.core.schemas import EventAnalysisReport, PostOpinionSummary
 from app.services.utils import get_web_context
 
 
 class AgentOpinions:
     """
-    Agent B: 舆情观点分析师 (High-Precision Mode)
-    核心架构：Search (查事实) + Map (多维观点聚类) -> Reduce (深度分层报告)
+    单模型版 Agent B：
+    - 主模型逐帖切片
+    - 主模型事件级成文
     """
 
     def __init__(self):
-        # 初始化 LLM
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL,  # 例如 "glm-4-flash"
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,
-            temperature=0.3,  # 稍微增加一点随机性以获取丰富观点
-            request_timeout=180,  #  增加超时时间
-            max_retries=3,
+        self.map_llm = get_main_llm(
+            temperature=0.2,
+            request_timeout=120,
+            max_retries=2,
+        )
+        self.reduce_llm = get_main_llm(
+            temperature=0.4,
+            request_timeout=180,
+            max_retries=2,
         )
 
-        # 初始化结构化解析器 (已弃用，改用 with_structured_output)
-        # self.map_parser = JsonOutputParser(pydantic_object=PostOpinionSummary)
-        # self.reduce_parser = JsonOutputParser(pydantic_object=EventAnalysisReport)
+    @staticmethod
+    def _is_content_filter(e: Exception) -> bool:
+        msg = str(e).lower()
+        return any(
+            kw in msg
+            for kw in [
+                "content_filter",
+                "content filter",
+                "content management",
+                "sensitive",
+                "refused",
+                "refusal",
+                "harmful",
+                "responsibleaipolicy",
+                "safety",
+            ]
+        )
+
+    @staticmethod
+    def _is_timeout(e: Exception) -> bool:
+        msg = str(e).lower()
+        return any(kw in msg for kw in ["timed out", "timeout", "read timeout"])
+
+    @staticmethod
+    def _select_comment_excerpts(raw_comments: Any, limit: int = 8) -> List[str]:
+        if not raw_comments:
+            return []
+        if not isinstance(raw_comments, list):
+            return [str(raw_comments)[:120]]
+
+        excerpts: List[str] = []
+        seen = set()
+        for item in raw_comments:
+            if isinstance(item, dict):
+                text = str(item.get("content") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if len(text) < 6 or text in seen:
+                continue
+            seen.add(text)
+            excerpts.append(text[:120])
+            if len(excerpts) >= limit:
+                break
+        return excerpts
+
+    def _build_web_context(
+        self,
+        event_name: str,
+        start_date: str,
+        end_date: str,
+    ) -> str:
+        query_groups = [
+            f"{event_name} 官方通报",
+            f"{event_name} 最新进展",
+            f"{event_name} 争议 焦点 网友质疑",
+        ]
+        if start_date or end_date:
+            period = f"{start_date[:10] if start_date else ''} {end_date[:10] if end_date else ''}".strip()
+            query_groups = [f"{q} {period}".strip() for q in query_groups]
+
+        web_context_parts: List[str] = []
+        for title, query in zip(["官方口径", "最新进展", "争议焦点"], query_groups):
+            try:
+                result = get_web_context(query, max_results=3, search_depth="basic")
+                if result:
+                    web_context_parts.append(f"【{title}】\n{result}")
+            except Exception as e:
+                logger.warning(f" [Agent B] 联网检索失败({title}): {e}")
+
+        return (
+            "\n\n".join(web_context_parts)
+            if web_context_parts
+            else "暂无可靠联网背景信息"
+        )
+
+    @staticmethod
+    def _build_timeline_digest(map_payloads: List[Dict[str, Any]]) -> str:
+        timeline_rows: List[Dict[str, str]] = []
+        for payload in map_payloads:
+            meta = payload.get("post_meta") or {}
+            summary = payload.get("summary") or {}
+            timeline_rows.append(
+                {
+                    "time": str(meta.get("create_date_time") or "").strip(),
+                    "trigger": str(summary.get("trigger_summary") or "").strip(),
+                    "propagation": str(summary.get("propagation_hint") or "").strip(),
+                }
+            )
+
+        valid_rows = [
+            row
+            for row in timeline_rows
+            if row["time"] or row["trigger"] or row["propagation"]
+        ]
+        if not valid_rows:
+            return "- 时间推进线索不足，暂无法形成稳定时间轴摘要。"
+
+        valid_rows.sort(key=lambda row: row["time"] or "9999-99-99 99:99:99")
+        lines: List[str] = []
+        for row in valid_rows[:6]:
+            if not row["trigger"] and not row["propagation"]:
+                continue
+            parts: List[str] = []
+            if row["trigger"]:
+                parts.append(f"触发：{row['trigger']}")
+            if row["propagation"]:
+                parts.append(f"扩散：{row['propagation']}")
+            time_part = row["time"] or "时间待核实"
+            lines.append(f"- {time_part} | {'；'.join(parts)}")
+
+        if not lines:
+            return "- 时间推进线索不足，暂无法形成稳定时间轴摘要。"
+        return "\n".join(lines)
+
+    def _map_single_post(self, post_data: Dict[str, Any], chain: Any) -> Dict[str, Any]:
+        post_content = post_data.get("content", "无内容")
+        media_content = post_data.get("media_context", "无媒体链接")
+        raw_comments = post_data.get("comments") or post_data.get("comment_items") or []
+        comments_text = "\n".join(
+            [
+                f"- {text}"
+                for text in self._select_comment_excerpts(raw_comments, limit=20)
+            ]
+        )
+        invoke_args = {
+            "post_content": post_content,
+            "media_content": media_content,
+            "comments_text": comments_text or "（暂无高赞评论样本）",
+            "improvement_hint": "",
+        }
+        try:
+            result = chain.invoke(invoke_args)
+            return (
+                result.model_dump() if hasattr(result, "model_dump") else dict(result)
+            )
+        except Exception as e:
+            if not self._is_content_filter(e):
+                raise
+            logger.warning(" [Agent B] 单帖切片触发过滤，移除评论重试...")
+            invoke_args["comments_text"] = "（评论样本因安全策略暂不可用）"
+            result = chain.invoke(invoke_args)
+            return (
+                result.model_dump() if hasattr(result, "model_dump") else dict(result)
+            )
 
     def analyze_event(
         self,
         event_name: str,
-        posts_data: List[Dict],
+        posts_data: List[Dict[str, Any]],
         start_date: str = "",
         end_date: str = "",
         improvement_hint: str = "",
     ) -> Dict[str, Any]:
-        """
-        全流程执行入口
-        :param event_name: 事件名称
-        :param posts_data: 列表，每个元素必须包含 {"content": str, "comments": List[str], "media_context": str}
-        :param improvement_hint: 质量门控反馋（重试时注入）
-        """
-        logger.info(f" [Agent B] 启动高精度舆情分析: “{event_name}”")
-
-        start_date = (start_date or "").strip()
-        end_date = (end_date or "").strip()
-        if start_date and end_date:
-            report_period = f"{start_date} 至 {end_date}"
-            period_hint = f"{start_date[:10]}~{end_date[:10]}"
-        elif start_date or end_date:
-            report_period = (
-                f"{start_date or '开始时间未知'} 至 {end_date or '结束时间未知'}"
-            )
-            period_hint = (
-                start_date[:10] if start_date else (end_date[:10] if end_date else "")
-            )
-        else:
-            report_period = "本期"
-            period_hint = ""
-
-        # --- Step 1: Search (联网获取背景事实) ---
-        web_context = "暂无网络背景信息"
-        logger.info(f"       [Search] 正在检索背景信息...")
-        try:
-            # 构造搜索词，确保获取官方口径
-            search_query = f"{event_name} {period_hint} 事件详情 官方通报".strip()
-            # 使用统一的 get_web_context 函数
-            web_context = get_web_context(search_query, max_results=3, search_depth="basic")
-        except Exception as e:
-            logger.warning(f" [Agent B] 联网检索失败，将使用空背景: {e}")
-
-        # --- Step 2: Map (分批处理热门贴) ---
-        logger.info(f" [Agent B] 正在扫描 {len(posts_data)} 个舆论战场(热门贴)...")
-
-        #  升级：使用 with_structured_output 替代 JsonOutputParser
-        # 这样更稳定，且不需要在 Prompt 里塞 format_instructions
-        structured_llm = self.llm.with_structured_output(PostOpinionSummary)
-        map_prompt = ChatPromptTemplate.from_template(AGENT_B_MAP_TEMPLATE)
-        map_chain = map_prompt | structured_llm
-
-        def _select_comment_excerpts(raw_comments: Any, limit: int = 8) -> List[str]:
-            if not raw_comments:
-                return []
-            if not isinstance(raw_comments, list):
-                return [str(raw_comments)[:120]]
-
-            excerpts: List[str] = []
-            seen = set()
-            for c in raw_comments:
-                t = (c or "").strip()
-                if len(t) < 8:
-                    continue
-                if t in seen:
-                    continue
-                seen.add(t)
-                excerpts.append(t[:120])
-                if len(excerpts) >= limit:
-                    break
-            return excerpts
-
-        map_payloads: List[Dict[str, Any]] = []
-
-        #  升级：并行处理 (ThreadPool) 加速 Map 阶段
-        # 建议根据 API Rate Limit 调整 max_workers (例如 5-10)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            # 提交所有任务
-            future_to_index = {
-                executor.submit(self._map_single_post, post, map_chain): (i, post)
-                for i, post in enumerate(posts_data)
+        logger.info(f" [Agent B] 启动重点深读: 《{event_name}》")
+        selected_posts = (posts_data or [])[:12]
+        if not selected_posts:
+            return {
+                "editorial_title": event_name,
+                "one_line_verdict": "该事件数据不足，暂无法形成有效深读判断。",
+                "event_overview": "数据不足",
+                "public_opinions": [],
+                "depth_analysis": "数据不足",
+                "key_quotes": [],
             }
 
+        web_context = self._build_web_context(event_name, start_date, end_date)
+
+        structured_map_llm = self.map_llm.with_structured_output(PostOpinionSummary)
+        map_chain = (
+            ChatPromptTemplate.from_template(AGENT_B_MAP_TEMPLATE) | structured_map_llm
+        )
+
+        map_payloads: List[Dict[str, Any]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            future_to_index = {
+                executor.submit(self._map_single_post, post, map_chain): (idx, post)
+                for idx, post in enumerate(selected_posts)
+            }
             for future in concurrent.futures.as_completed(future_to_index):
-                i, post = future_to_index[future]
+                idx, post = future_to_index[future]
                 try:
                     summary = future.result()
                     map_payloads.append(
                         {
-                            "index": i,
+                            "index": idx,
                             "summary": summary,
-                            "comment_excerpts": _select_comment_excerpts(
-                                post.get("comments", []), limit=8
+                            "comment_excerpts": self._select_comment_excerpts(
+                                post.get("comment_items") or post.get("comments") or [],
+                                limit=8,
                             ),
+                            "post_meta": {
+                                "liked_count": post.get("liked_count", "0"),
+                                "comments_count": post.get("comments_count", "0"),
+                                "create_date_time": post.get("create_date_time", ""),
+                            },
                         }
                     )
                 except Exception as e:
-                    logger.warning(f"       帖子 {i+1} Map分析跳过: {e}")
+                    logger.warning(f" [Agent B] 帖子切片失败，已跳过: {e}")
 
-        map_payloads.sort(key=lambda x: x.get("index", 0))
-
+        map_payloads.sort(key=lambda item: item.get("index", 0))
         if not map_payloads:
             return {
-                "event_overview": "有效观点过少，无法生成报告",
+                "editorial_title": event_name,
+                "one_line_verdict": "该事件样本不足，暂无法形成可靠结论。",
+                "event_overview": "数据不足",
                 "public_opinions": [],
                 "depth_analysis": "数据不足",
+                "key_quotes": [],
             }
 
-        # --- Step 3: Reduce (深度聚合) ---
-        logger.info(f" [Agent B] 正在聚合多维观点，生成深度报告 (Reduce)...")
-        try:
-            final_report = self._reduce_summaries(
-                event_name=event_name,
-                report_period=report_period,
-                web_context=web_context,
-                map_payloads=map_payloads,
-                improvement_hint=improvement_hint,
-            )
-            logger.info(f" [Agent B] 事件 “{event_name}” 分析完成。")
-
-            # 返回字典供 State 存储
-            # 如果 final_report 是 Pydantic 对象则 dump，如果是 dict 则直接返回
-            if hasattr(final_report, "model_dump"):
-                return final_report.model_dump()
-            return final_report
-
-        except Exception as e:
-            logger.error(f" [Agent B] Reduce 阶段失败: {e}")
-            return {
-                "event_overview": "报告生成异常",
-                "public_opinions": [],
-                "depth_analysis": f"Error: {str(e)}",
-            }
-
-    @staticmethod
-    def _is_content_filter(e: Exception) -> bool:
-        """判断异常是否为 LLM 内容安全过滤"""
-        msg = str(e).lower()
-        return any(kw in msg for kw in [
-            "content_filter", "content filter", "content management",
-            "sensitive", "refused", "refusal", "harmful",
-            "responsibleaipolicy", "safety",
-        ])
-
-    def _map_single_post(self, post_data: Dict, chain: Any) -> PostOpinionSummary:
-        """
-        Map 逻辑：针对单个帖子进行【观点聚类】
-        内容安全过滤时自动重试（截断评论后降级调用）
-        """
-        # 1. 提取帖子内容
-        post_content = post_data.get("content", "无内容")
-
-        # 2. 提取媒体上下文 (由 Nodes.py 组装好的字符串)
-        media_content = post_data.get("media_context", "无媒体链接")
-
-        # 3. 提取评论 (Nodes.py 传进来的是 List[str])
-        raw_comments = post_data.get("comments", [])
-
-        if isinstance(raw_comments, list):
-            comments_text = "\n".join([f"- {c}" for c in raw_comments])
-        else:
-            comments_text = str(raw_comments)
-
-        invoke_args = {
-            "post_content": post_content,
-            "media_content": media_content,
-            "comments_text": comments_text,
-            "improvement_hint": "",  # Map 阶段无需质量反馈
-        }
-
-        # 第一次尝试（全量数据）
-        try:
-            return chain.invoke(invoke_args)
-        except Exception as e:
-            if not self._is_content_filter(e):
-                raise  # 非过滤异常直接上抛
-
-        # 第二次尝试：截断评论到 30 条，降低敏感内容浓度
-        logger.warning(" [Agent B] Map 触发内容过滤，截断评论后重试...")
-        if isinstance(raw_comments, list):
-            truncated = raw_comments[:30]
-            comments_text = "\n".join([f"- {c}" for c in truncated])
-        invoke_args["comments_text"] = comments_text
-
-        try:
-            return chain.invoke(invoke_args)
-        except Exception as e2:
-            if not self._is_content_filter(e2):
-                raise
-
-        # 第三次：只保留帖子正文，完全去掉评论
-        logger.warning(" [Agent B] Map 二次过滤，去除评论后重试...")
-        invoke_args["comments_text"] = "（评论数据因安全策略暂不可用）"
-        return chain.invoke(invoke_args)  # 最后一次不再兜底，让上层跳过
-
-    def _reduce_summaries(
-        self,
-        event_name: str,
-        report_period: str,
-        web_context: str,
-        map_payloads: List[Dict[str, Any]],
-        improvement_hint: str = "",
-    ) -> EventAnalysisReport:
-        """
-        Reduce 逻辑：将碎片化的【观点簇】缝合成一份有层次感的报告
-        """
-        # 格式化 Map 结果
         mapped_text_list = []
-
-        for i, payload in enumerate(map_payloads):
-            res = (payload or {}).get("summary")
-            comment_excerpts = (payload or {}).get("comment_excerpts") or []
-            # 兼容性处理：防止 res 是 dict 而不是对象
-            if isinstance(res, dict):
-                # 如果是 dict，尝试转成 Pydantic 对象，或者直接读 key
-                clusters = res.get("opinion_clusters", [])
-                conflict = res.get("conflict_analysis", "无")
-            else:
-                clusters = res.opinion_clusters
-                conflict = res.conflict_analysis
-
-            # 遍历该帖子下的所有观点簇
-            clusters_desc = []
+        for idx, payload in enumerate(map_payloads, start=1):
+            summary = payload.get("summary") or {}
+            clusters = summary.get("opinion_clusters") or []
+            cluster_desc = []
             for cluster in clusters:
-                # 兼容 cluster 可能是 dict
-                if isinstance(cluster, dict):
-                    ratio = cluster.get("estimated_ratio", "")
-                    emotion = cluster.get("emotion", "")
-                    viewpoint = cluster.get("viewpoint", "")
-                else:
-                    ratio = cluster.estimated_ratio
-                    emotion = cluster.emotion
-                    viewpoint = cluster.viewpoint
-
-                clusters_desc.append(f"[{ratio} - {emotion}]: {viewpoint}")
-
-            cluster_text = "; ".join(clusters_desc)
-
-            # 预处理评论摘录（f-string 中不能包含反斜杠）
-            excerpts_lines = []
-            for t in comment_excerpts[:8]:
-                cleaned = str(t).replace("\n", " ")[:120]
-                excerpts_lines.append(f"\n   - {cleaned}")
-            excerpts_text = "".join(excerpts_lines)
-
-            entry = (
-                f"【帖子{i+1} 分析切片】\n"
-                f"   - 冲突分析: {conflict}\n"
-                f"   - 观点分布: {cluster_text}\n"
-                f"   - 评论样本摘录:{excerpts_text if excerpts_text else '（无）'}"
+                cluster_desc.append(
+                    f"[{cluster.get('estimated_ratio', '')} - {cluster.get('emotion', '')}] {cluster.get('viewpoint', '')}"
+                )
+            excerpts = payload.get("comment_excerpts") or []
+            quotes_text = "\n".join([f"   - {quote}" for quote in excerpts[:8]])
+            meta = payload.get("post_meta") or {}
+            mapped_text_list.append(
+                (
+                    f"【帖子{idx}】\n"
+                    f"热度: 点赞{meta.get('liked_count','0')} / 评论{meta.get('comments_count','0')}\n"
+                    f"时间: {meta.get('create_date_time','')}\n"
+                    f"冲突分析: {summary.get('conflict_analysis', '无')}\n"
+                    f"触发点: {summary.get('trigger_summary', '待补充')}\n"
+                    f"传播方向: {summary.get('propagation_hint', '待补充')}\n"
+                    f"观点分布: {'; '.join(cluster_desc) or '无明显观点分歧'}\n"
+                    f"评论样本:\n{quotes_text or '   - （无）'}"
+                )
             )
-            mapped_text_list.append(entry)
-
-        # 拼成一个超长文本喂给 Reduce LLM
         mapped_summaries = "\n\n".join(mapped_text_list)
+        timeline_digest = self._build_timeline_digest(map_payloads)
 
-        #  升级：使用 with_structured_output 替代 JsonOutputParser
-        structured_llm = self.llm.with_structured_output(EventAnalysisReport)
+        structured_reduce_llm = self.reduce_llm.with_structured_output(
+            EventAnalysisReport
+        )
+        reduce_chain = (
+            ChatPromptTemplate.from_template(AGENT_B_REDUCE_TEMPLATE)
+            | structured_reduce_llm
+        )
 
-        prompt = ChatPromptTemplate.from_template(AGENT_B_REDUCE_TEMPLATE)
-        chain = prompt | structured_llm
-
-        # 第一次尝试（全量 map 数据）
         try:
-            return chain.invoke(
+            report_obj = reduce_chain.invoke(
                 {
                     "event_name": event_name,
-                    "report_period": report_period,
+                    "report_period": (
+                        f"{start_date or '开始时间未知'} 至 {end_date or '结束时间未知'}"
+                        if (start_date or end_date)
+                        else "本期"
+                    ),
                     "web_search_context": web_context,
                     "mapped_summaries": mapped_summaries,
+                    "timeline_digest": timeline_digest,
                     "improvement_hint": improvement_hint or "",
                 }
             )
         except Exception as e:
-            if not self._is_content_filter(e):
+            if self._is_timeout(e):
+                logger.warning(
+                    " [Agent B] 事件级成文超时，压缩上下文后使用主模型重试一次..."
+                )
+                fallback_reduce_chain = ChatPromptTemplate.from_template(
+                    AGENT_B_REDUCE_TEMPLATE
+                ) | self.reduce_llm.with_structured_output(EventAnalysisReport)
+                report_obj = fallback_reduce_chain.invoke(
+                    {
+                        "event_name": event_name,
+                        "report_period": (
+                            f"{start_date or '开始时间未知'} 至 {end_date or '结束时间未知'}"
+                            if (start_date or end_date)
+                            else "本期"
+                        ),
+                        "web_search_context": web_context,
+                        "mapped_summaries": mapped_summaries,
+                        "timeline_digest": "\n".join(timeline_digest.splitlines()[:6]),
+                        "improvement_hint": (improvement_hint or "")
+                        + "（主模型超时，已压缩时间线后重试）",
+                    }
+                )
+            elif not self._is_content_filter(e):
                 raise
+            else:
+                logger.warning(" [Agent B] 事件级成文触发过滤，截断切片后重试...")
+                report_obj = reduce_chain.invoke(
+                    {
+                        "event_name": event_name,
+                        "report_period": (
+                            f"{start_date or '开始时间未知'} 至 {end_date or '结束时间未知'}"
+                            if (start_date or end_date)
+                            else "本期"
+                        ),
+                        "web_search_context": web_context,
+                        "mapped_summaries": "\n\n".join(mapped_text_list[:6]),
+                        "timeline_digest": "\n".join(timeline_digest.splitlines()[:6]),
+                        "improvement_hint": (improvement_hint or "")
+                        + "（部分切片已截断）",
+                    }
+                )
 
-        # 内容过滤 → 截断 map 数据到前 5 条后重试
-        logger.warning(" [Agent B] Reduce 触发内容过滤，截断数据后重试...")
-        truncated_summaries = "\n\n".join(mapped_text_list[:5])
-        return chain.invoke(
-            {
-                "event_name": event_name,
-                "report_period": report_period,
-                "web_search_context": web_context,
-                "mapped_summaries": truncated_summaries,
-                "improvement_hint": (improvement_hint or "") + " (部分数据因安全策略已截断)",
-            }
+        report = (
+            report_obj.model_dump()
+            if hasattr(report_obj, "model_dump")
+            else dict(report_obj)
         )
+        report.setdefault("editorial_title", event_name)
+        report.setdefault("one_line_verdict", report.get("event_overview", ""))
+        report.setdefault("key_quotes", [])
+        return report
 
 
-# 单例导出
 agent_opinions = AgentOpinions()

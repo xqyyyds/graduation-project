@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>{{ report.meta.title }}</title>
+    <style>
+      @font-face {
+        font-family: "LocalPdfCn";
+        src: url("file:///C:/Windows/Fonts/msyh.ttc");
+      }
+
+      :root {
+        color-scheme: light;
+        --ink: #1f2937;
+        --muted: #6b7280;
+        --line: #dbe4f0;
+        --panel: #ffffff;
+        --panel-soft: #f8fbff;
+        --accent: #1d4ed8;
+        --accent-soft: #e8f1ff;
+        --danger: #b91c1c;
+        --shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+      }
+
+      @page {
+        size: A4;
+        margin: 14mm 12mm;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "LocalPdfCn", "Microsoft YaHei", "PingFang SC", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(
+            circle at top left,
+            rgba(29, 78, 216, 0.08),
+            transparent 30%
+          ),
+          linear-gradient(180deg, #f3f7fb 0%, #eef4fb 100%);
+        line-height: 1.75;
+      }
+
+      .report-shell {
+        max-width: 1200px;
+        margin: 32px auto;
+        padding: 28px 32px 40px;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.55);
+        box-shadow: var(--shadow);
+        border-radius: 28px;
+        backdrop-filter: blur(18px);
+      }
+
+      .report-header {
+        padding-bottom: 24px;
+        border-bottom: 1px solid var(--line);
+        margin-bottom: 28px;
+      }
+
+      .report-title {
+        margin: 0;
+        font-size: 30px;
+        font-weight: 800;
+        line-height: 1.3;
+        color: #111827;
+      }
+
+      .report-meta {
+        margin-top: 14px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      section {
+        margin-top: 28px;
+      }
+
+      h2 {
+        margin: 0 0 18px;
+        padding: 10px 14px;
+        font-size: 20px;
+        border-radius: 14px;
+        background: var(--accent-soft);
+        color: #123a8b;
+      }
+
+      h3 {
+        margin: 18px 0 10px;
+        font-size: 18px;
+      }
+
+      .overview-table {
+        width: 100%;
+        border-collapse: collapse;
+        overflow: hidden;
+        border-radius: 16px;
+        background: var(--panel);
+      }
+
+      .overview-table th,
+      .overview-table td {
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .overview-table th {
+        background: var(--panel-soft);
+        color: #123a8b;
+      }
+
+      .deep-read-card,
+      .forecast-card,
+      .case-card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 18px 20px;
+        margin-bottom: 16px;
+      }
+
+      .verdict {
+        padding: 12px 14px;
+        border-left: 4px solid var(--accent);
+        background: var(--panel-soft);
+        border-radius: 0 12px 12px 0;
+        margin: 12px 0;
+        font-weight: 600;
+      }
+
+      .opinion-list {
+        margin: 0;
+        padding-left: 18px;
+      }
+
+      .quote-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .subsection-title {
+        margin: 18px 0 10px;
+        font-size: 16px;
+        font-weight: 800;
+        color: #111827;
+      }
+
+      .quote-item {
+        background: #f8fafc;
+        border-radius: 14px;
+        padding: 10px 12px;
+        color: #475569;
+      }
+
+      .summary-strip {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 18px;
+      }
+
+      .summary-card {
+        min-width: 180px;
+        flex: 1;
+        padding: 16px 18px;
+        background: var(--panel-soft);
+        border-radius: 18px;
+        border: 1px solid var(--line);
+      }
+
+      .summary-label {
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.4px;
+      }
+
+      .summary-value {
+        margin-top: 8px;
+        font-size: 28px;
+        font-weight: 800;
+        color: #111827;
+      }
+
+      .case-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+
+      .case-tag {
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
+      .risk-high {
+        background: rgba(185, 28, 28, 0.1);
+        color: var(--danger);
+      }
+
+      .case-quote {
+        font-size: 16px;
+        font-weight: 700;
+        margin-bottom: 10px;
+      }
+
+      .case-detail {
+        color: #475569;
+        margin-top: 8px;
+      }
+
+      .point-card {
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: #f8fafc;
+        margin-top: 12px;
+        break-inside: avoid;
+      }
+
+      .point-title {
+        font-weight: 700;
+        margin-bottom: 8px;
+      }
+
+      .point-row {
+        margin-top: 8px;
+        color: var(--muted);
+      }
+
+      .point-label {
+        font-weight: 700;
+        color: var(--ink);
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .deep-read-card,
+      .forecast-card,
+      .case-card,
+      .summary-card {
+        break-inside: avoid;
+      }
+
+      .appendix-event-card {
+        margin-top: 18px;
+        padding: 18px;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        background: #fafcff;
+      }
+
+      @media print {
+        body {
+          background: #ffffff;
+        }
+
+        .report-shell {
+          margin: 0;
+          max-width: none;
+          border: none;
+          box-shadow: none;
+          background: #ffffff;
+          padding: 0;
+          border-radius: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="report-shell">
+      <header class="report-header">
+        <h1 class="report-title">{{ report.meta.title }}</h1>
+        <div class="report-meta">
+          <span class="pill">{{ report.meta.category }}</span>
+          <span>生成时间：{{ report.meta.generated_at }}</span>
+          <span>研判周期：{{ report.meta.report_period }}</span>
+        </div>
+      </header>
+
+      <section>
+        <h2>前言：舆情态势综述</h2>
+        {% if report.preface.paragraphs %} {% for item in
+        report.preface.paragraphs %}
+        <p>{{ item }}</p>
+        {% endfor %} {% else %}
+        <p>（前言生成异常）</p>
+        {% endif %}
+      </section>
+
+      <section>
+        <h2>第一部分：本期热点舆情总览</h2>
+        <table class="overview-table">
+          <thead>
+            <tr>
+              <th>序号</th>
+              <th>时间</th>
+              <th>事件名称</th>
+              <th>热度值</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in report.overview_table %}
+            <tr>
+              <td>{{ row.seq }}</td>
+              <td>{{ row.time }}</td>
+              <td>{{ row.event_name }}</td>
+              <td>{{ row.heat_value }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>第二部分：重点舆情深读</h2>
+        {% for item in report.deep_reads %}
+        <article class="deep-read-card">
+          <h3>{{ loop.index }}. {{ item.editorial_title }}</h3>
+          {% if item.one_line_verdict %}
+          <div class="verdict">{{ item.one_line_verdict }}</div>
+          {% endif %} {% if item.event_overview %}
+          <div class="subsection-title">事件概况</div>
+          <p>{{ item.event_overview }}</p>
+          {% endif %} {% if item.public_opinions %}
+          <div class="subsection-title">舆论观点画像</div>
+          <ul class="opinion-list">
+            {% for opinion in item.public_opinions %}
+            <li>{{ opinion }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %} {% if item.depth_analysis %}
+          <div class="subsection-title">深度研判</div>
+          <p>{{ item.depth_analysis }}</p>
+          {% endif %} {% if item.key_quotes %}
+          <div class="subsection-title">关键引用</div>
+          <div class="quote-list">
+            {% for quote in item.key_quotes %}
+            <div class="quote-item">{{ quote }}</div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </article>
+        {% endfor %}
+      </section>
+
+      <section>
+        <h2>第三部分：违规风险透视</h2>
+        <div class="summary-strip">
+          <div class="summary-card">
+            <div class="summary-label">确认违规案例</div>
+            <div class="summary-value">
+              {{ report.compliance.summary.total_cases }}
+            </div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-label">涉及事件</div>
+            <div class="summary-value">
+              {{ report.compliance.summary.event_count }}
+            </div>
+          </div>
+        </div>
+        {% if report.compliance.summary.phase_summary %}
+        <article class="forecast-card">
+          <h3>本期违规态势总结</h3>
+          <p>{{ report.compliance.summary.phase_summary }}</p>
+        </article>
+        {% endif %}
+
+        <article class="forecast-card">
+          <h3>风险等级分布</h3>
+          <table class="overview-table">
+            <thead>
+              <tr>
+                <th>风险等级</th>
+                <th>次数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in report.compliance.summary.risk_levels %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>{{ item.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+
+        <article class="forecast-card">
+          <h3>主要违规类别</h3>
+          <table class="overview-table">
+            <thead>
+              <tr>
+                <th>违规类别</th>
+                <th>次数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in report.compliance.summary.categories[:8] %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>{{ item.count }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+      </section>
+
+      <section>
+        <h2>第四部分：未来趋势与战略预警</h2>
+        {% for topic in report.forecast.topics %}
+        <article class="forecast-card">
+          <h3>{{ loop.index }}. {{ topic.topic_name }}</h3>
+          {% if topic.background %}
+          <p>{{ topic.background }}</p>
+          {% endif %} {% set topic_audience = topic.audience or '' %} {% set
+          topic_scene = topic.scene_opening or '' %} {% if not topic_audience
+          and topic.points %} {% set topic_audience = topic.points[0].audience
+          or '' %} {% endif %} {% if not topic_scene and topic.points %} {% set
+          topic_scene = topic.points[0].scene or '' %} {% endif %} {% if
+          topic.main_tension or topic_audience or topic_scene %}
+          <div class="case-detail">
+            <strong>预警摘要：</strong>
+            {% if topic.main_tension %}核心矛盾：{{ topic.main_tension }}{%
+            endif %} {% if topic.main_tension and topic_audience %}；{% endif %}
+            {% if topic_audience %}涉及人群：{{ topic_audience }}{% endif %} {%
+            if (topic.main_tension or topic_audience) and topic_scene %}；{%
+            endif %} {% if topic_scene %}典型场景：{{ topic_scene }}{% endif %}
+          </div>
+          {% endif %} {% for point in topic.points %}
+          <div class="point-card">
+            <div class="point-title">{{ point.subtitle }}</div>
+            <p>{{ point.summary_paragraph or point.content }}</p>
+          </div>
+          {% endfor %}
+        </article>
+        {% endfor %}
+      </section>
+
+      <section>
+        <h2>附录：违规数据监测</h2>
+        {% set appendix = report.appendix_stats if report.appendix_stats is
+        defined else {'risk_levels': [], 'categories': [], 'laws': []} %}
+        <article class="forecast-card">
+          <h3>风险等级分布</h3>
+          <table class="overview-table">
+            <thead>
+              <tr>
+                <th>风险等级</th>
+                <th>次数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in appendix.risk_levels %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>
+                  {{ item.count if item.count is defined else item.value }}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+
+        <article class="forecast-card">
+          <h3>违规类别分布</h3>
+          <table class="overview-table">
+            <thead>
+              <tr>
+                <th>违规类别</th>
+                <th>次数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in appendix.categories %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>
+                  {{ item.count if item.count is defined else item.value }}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+
+        <article class="forecast-card">
+          <h3>依据条款分布</h3>
+          <table class="overview-table">
+            <thead>
+              <tr>
+                <th>条款</th>
+                <th>次数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in appendix.laws %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>
+                  {{ item.count if item.count is defined else item.value }}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+
+        {% if report.appendix_cases %}
+        <article class="forecast-card">
+          <h3>违规案例明细</h3>
+          {% for event in report.appendix_cases %}
+          <div class="appendix-event-card">
+            <h4>{{ loop.index }}. {{ event.event_name }}</h4>
+            {% for case in event.cases %}
+            <div class="case-card">
+              <div class="case-meta">
+                <span class="case-tag">{{ case.source_type }}</span>
+                <span class="case-tag">{{ case.category }}</span>
+                <span
+                  class="case-tag {% if case.risk_level == 'High' %}risk-high{% endif %}"
+                  >{{ case.risk_level }}</span
+                >
+              </div>
+              <div class="case-detail">
+                <strong>来源ID：</strong>{{ case.source_id }}
+              </div>
+              <div class="case-detail">
+                <strong>序号：</strong>{{ case.index }}
+              </div>
+              <div class="case-detail">
+                <strong>所属事件：</strong>{{ case.event_name or
+                event.event_name }}
+              </div>
+              <div class="case-detail">
+                <strong>违规摘录：</strong>{{ case.quote }}
+              </div>
+              <div class="case-detail">
+                <strong>判定理由：</strong>{{ case.reasoning }}
+              </div>
+              <div class="case-detail">
+                <strong>主要依据：</strong>{{ case.primary_law }}
+              </div>
+              {% if case.law_reason %}
+              <div class="case-detail">
+                <strong>法规说明：</strong>{{ case.law_reason }}
+              </div>
+              {% endif %}
+              <div class="case-detail">
+                <strong>证据链：</strong>{{ case.evidence_chain }}
+              </div>
+              <div class="case-detail">
+                <strong>处置建议：</strong>{{ case.disposal_suggestion }}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        </article>
+        {% endif %}
+      </section>
+    </main>
+  </body>
+</html>

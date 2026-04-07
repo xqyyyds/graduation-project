@@ -7,10 +7,9 @@ import concurrent.futures
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import settings
+from app.core.llm_factory import get_main_llm
 from app.core.logger import logger
 
 
@@ -80,10 +79,7 @@ class CategoryClassifier:
     VALID_CATEGORIES = ["社会", "高校", "生活", "科技", "政治", "其他"]
 
     def __init__(self):
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,
+        self.llm = get_main_llm(
             temperature=0.1,
             request_timeout=60,
             max_retries=2,
@@ -158,6 +154,7 @@ class CategoryClassifier:
         words: List[str],
         max_workers: int = 8,
         existing_categories: Optional[Dict[str, str]] = None,
+        batch_size: int = 20,
     ) -> Dict[str, str]:
         """
         并行分类热搜词条
@@ -181,22 +178,39 @@ class CategoryClassifier:
         )
 
         results = dict(existing)  # 复制已有结果
+        batches = [
+            to_classify[i : i + batch_size]
+            for i in range(0, len(to_classify), batch_size)
+        ]
+        worker_count = min(max_workers, max(1, len(batches), 4))
 
-        # 并行调用
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_word = {
-                executor.submit(self.classify_single, word): word
-                for word in to_classify
+        logger.info(
+            f"   [分类] 批量模式启动：{len(batches)} 批，每批最多 {batch_size} 个词条，并发 {worker_count}"
+        )
+
+        def process_batch(batch_words: List[str]) -> Dict[str, str]:
+            return self.classify_batch(batch_words, batch_size=len(batch_words))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_batch_idx = {
+                executor.submit(process_batch, batch): idx
+                for idx, batch in enumerate(batches, start=1)
             }
 
-            for future in concurrent.futures.as_completed(future_to_word):
-                word = future_to_word[future]
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_batch_idx):
+                batch_idx = future_to_batch_idx[future]
                 try:
-                    category = future.result()
-                    results[word] = category
+                    batch_result = future.result()
+                    results.update(batch_result)
                 except Exception as e:
-                    logger.error(f"   [分类] {word} 并行处理失败: {e}")
-                    results[word] = "其他"
+                    logger.error(f"   [分类] 批次 {batch_idx} 并行处理失败: {e}")
+                    for word in batches[batch_idx - 1]:
+                        if word not in results:
+                            results[word] = "其他"
+                completed += 1
+                if completed == len(batches) or completed % 5 == 0:
+                    logger.info(f"   [分类] 批量进度: {completed}/{len(batches)} 批已完成")
 
         logger.info(f"   [分类] 完成，共 {len(results)} 个词条")
         return results

@@ -2,9 +2,13 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 import concurrent.futures
 from dateutil.relativedelta import relativedelta
-from langchain_openai import ChatOpenAI
 from app.core.logger import logger
 from app.core.config import settings
+from app.core.llm_factory import get_main_llm
+from langchain_core.prompts import ChatPromptTemplate
+
+from app.core.schemas import EventDuplicateCheck
+from app.core.prompts import EVENT_DUPLICATE_CHECK_PROMPT
 
 # 1. 引入同级目录下的 State
 from app.agents.state import GraphState
@@ -26,6 +30,75 @@ from app.db.mongo_manager import mongo_db
 
 # 5. 引入分类服务
 from app.services.category_classifier import category_classifier
+
+
+def _is_duplicate_event_simple(event_name: str, selected_names: List[str]) -> bool:
+    if not selected_names:
+        return False
+    event_name_clean = (event_name or "").strip().replace("#", "")
+    for selected_name in selected_names:
+        selected_clean = (selected_name or "").strip().replace("#", "")
+        if event_name_clean == selected_clean:
+            return True
+        if event_name_clean in selected_clean or selected_clean in event_name_clean:
+            if abs(len(event_name_clean) - len(selected_clean)) <= 5:
+                return True
+    return False
+
+
+def _build_focus_events(
+    all_events: List[Dict[str, Any]], target_count: int = 5
+) -> List[Dict[str, Any]]:
+    """前置圈定重点事件：按热度遍历，结合LLM去重，筛出最多 target_count 个有数据事件。"""
+    if not all_events:
+        return []
+
+    dedup_llm = get_main_llm(
+        temperature=0.1,
+        request_timeout=60,
+        max_retries=2,
+    )
+    structured_dedup_llm = dedup_llm.with_structured_output(EventDuplicateCheck)
+    dedup_prompt = ChatPromptTemplate.from_template(EVENT_DUPLICATE_CHECK_PROMPT)
+
+    selected: List[Dict[str, Any]] = []
+    selected_names: List[str] = []
+
+    for event in all_events:
+        if len(selected) >= target_count:
+            break
+
+        event_name = event.get("event_name", "未知")
+        posts_data = event.get("_fetched_posts", []) or []
+        if not posts_data:
+            continue
+
+        is_duplicate = False
+        if selected_names:
+            try:
+                chain = dedup_prompt | structured_dedup_llm
+                result = chain.invoke(
+                    {
+                        "current_event": event_name,
+                        "analyzed_events": ", ".join(selected_names),
+                    }
+                )
+                is_duplicate = bool(result and result.is_same_event)
+            except Exception as e:
+                logger.warning(f"    [A-Select] LLM 去重失败，使用规则兜底: {e}")
+                is_duplicate = _is_duplicate_event_simple(event_name, selected_names)
+
+        if is_duplicate:
+            logger.info(f"    [A-Select] 跳过重复重点事件: {event_name}")
+            continue
+
+        selected.append(event)
+        selected_names.append(event_name)
+
+    logger.info(
+        f"    [A-Select] 圈定重点事件 {len(selected)} 个：{', '.join(selected_names) if selected_names else '无'}"
+    )
+    return selected
 
 
 # =====================================================
@@ -93,7 +166,12 @@ def classify_node(state: GraphState) -> Dict[str, Any]:
 def agent_a_node(state: GraphState) -> Dict[str, Any]:
     FETCH_EVENT_COUNT = 20
     POSTS_PER_EVENT = 15
-    COMMENTS_PER_POST = 200
+    DEEP_READ_COMMENTS_PER_POST = 20
+    # 单贴审核候选评论总量控制在 40 条，降低长上下文带来的幻觉风险。
+    AUDIT_HOT_COMMENTS_PER_POST = 20
+    AUDIT_RECENT_COMMENTS_PER_POST = 20
+    FETCH_WORKERS = 6
+    FOCUS_EVENT_COUNT = 5
 
     category = state.get("category")
     category_label = (
@@ -150,13 +228,31 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
     # Phase 3: 并行抓取帖子+评论 — 为 B/C 准备数据
     # -----------------------------------------------------------------
     target_events = core_events[:FETCH_EVENT_COUNT]
-    logger.info(f"    [A-Phase3] 并行抓取前 {len(target_events)} 个事件的帖子+评论...")
+    logger.info(
+        f"    [A-Phase3] 并行抓取候选池：前 {len(target_events)} 个事件的帖子+评论（仅用于后续圈定重点）..."
+    )
 
     def fetch_event_posts(event):
         """抓取单个事件的帖子和评论数据"""
         try:
             keywords = event.get("related_keywords", [])
             raw_posts = mongo_db.get_posts_by_keywords(keywords, limit=POSTS_PER_EVENT)
+            note_ids = [
+                str(p.get("note_id") or "").strip()
+                for p in (raw_posts or [])
+                if str(p.get("note_id") or "").strip()
+            ]
+            deep_read_comment_map = mongo_db.get_grouped_comments_by_post_ids(
+                note_ids=note_ids,
+                limit_per_post=DEEP_READ_COMMENTS_PER_POST,
+                sort_field="comment_like_count",
+                descending=True,
+            )
+            audit_comment_map = mongo_db.get_comment_candidates_by_post_ids(
+                note_ids=note_ids,
+                hot_limit=AUDIT_HOT_COMMENTS_PER_POST,
+                recent_limit=AUDIT_RECENT_COMMENTS_PER_POST,
+            )
             valid_posts_data = []
 
             for p in raw_posts or []:
@@ -164,20 +260,44 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
                 if not note_id:
                     continue
 
-                comments = mongo_db.get_comments_by_post_ids(
-                    [note_id], limit=COMMENTS_PER_POST
-                )
+                deep_read_comments = deep_read_comment_map.get(note_id, [])
+                audit_comments = audit_comment_map.get(note_id, [])
 
                 comment_texts = []
                 comment_items = []
-                for c in comments or []:
+                for c in deep_read_comments or []:
                     if not isinstance(c, dict):
                         continue
                     content = (c.get("content") or "").strip()
-                    if not content:
+                    if not content or len(content) < 2:
                         continue
                     comment_texts.append(content)
-                    comment_items.append({"db_id": c.get("_id"), "content": content})
+                    comment_items.append(
+                        {
+                            "db_id": str(c.get("_id")) if c.get("_id") else "",
+                            "comment_id": str(c.get("comment_id") or ""),
+                            "content": content,
+                            "create_date_time": c.get("create_date_time", ""),
+                            "comment_like_count": c.get("comment_like_count", "0"),
+                        }
+                    )
+
+                audit_comment_items = []
+                for c in audit_comments or []:
+                    if not isinstance(c, dict):
+                        continue
+                    content = (c.get("content") or "").strip()
+                    if not content or len(content) < 2:
+                        continue
+                    audit_comment_items.append(
+                        {
+                            "db_id": str(c.get("_id")) if c.get("_id") else "",
+                            "comment_id": str(c.get("comment_id") or ""),
+                            "content": content,
+                            "create_date_time": c.get("create_date_time", ""),
+                            "comment_like_count": c.get("comment_like_count", "0"),
+                        }
+                    )
 
                 image_list_raw = p.get("image_list", "") or ""
                 image_urls = [u.strip() for u in image_list_raw.split(",") if u.strip()]
@@ -193,15 +313,13 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
                     "note_id": note_id,
                     "db_id": str(p.get("_id")) if p.get("_id") else "",
                     "content": p.get("full_content") or p.get("content", ""),
+                    "source_keyword": p.get("source_keyword", ""),
+                    "create_date_time": p.get("create_date_time", ""),
+                    "liked_count": p.get("liked_count", "0"),
+                    "comments_count": p.get("comments_count", "0"),
                     "comments": comment_texts,
-                    "comment_items": [
-                        (
-                            {**item, "db_id": str(item["db_id"])}
-                            if item.get("db_id")
-                            else item
-                        )
-                        for item in comment_items
-                    ],
+                    "comment_items": [item for item in comment_items],
+                    "audit_comment_items": audit_comment_items,
                     "media_context": media_context,
                     "audit_status": p.get("audit_status"),
                     "is_violation": p.get("is_violation"),
@@ -209,13 +327,17 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
                 }
                 valid_posts_data.append(post_packet)
 
+            logger.info(
+                f"    [A-Phase3] 候选池抓取完成: 《{event.get('event_name', '未知事件')}》"
+                f" -> {len(valid_posts_data)} 贴 / {sum(len(p.get('audit_comment_items', [])) for p in valid_posts_data)} 条审核候选评论"
+            )
             return valid_posts_data
         except Exception as e:
             logger.error(f"    [A-Phase3] 数据抓取失败: {e}")
             return []
 
     events_with_data = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
         future_to_event = {
             executor.submit(fetch_event_posts, evt): evt for evt in target_events
         }
@@ -233,13 +355,19 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
 
     events_with_data.sort(key=lambda x: x.get("total_heat", 0), reverse=True)
     final_list = events_with_data + core_events[FETCH_EVENT_COUNT:]
+    focus_events = _build_focus_events(events_with_data, target_count=FOCUS_EVENT_COUNT)
 
     logger.info(
         f" [Node A] 完成：ETL {len(clean_events)} 事件 → "
         f"选题 {len(core_events)} 个 → "
-        f"抓取 {len(events_with_data)} 个事件数据"
+        f"抓取 {len(events_with_data)} 个事件数据 → "
+        f"圈定重点 {len(focus_events)} 个"
     )
-    return {"core_events": final_list, "current_step": "A_Done"}
+    return {
+        "core_events": final_list,
+        "focus_events": focus_events,
+        "current_step": "A_Done",
+    }
 
 
 # =====================================================
@@ -248,92 +376,31 @@ def agent_a_node(state: GraphState) -> Dict[str, Any]:
 # 只写 analyzed_events，不影响 core_events
 # =====================================================
 def agent_b_analyze_node(state: GraphState) -> Dict[str, Any]:
-    from langchain_openai import ChatOpenAI
-    from langchain_core.prompts import ChatPromptTemplate
-    from app.core.schemas import EventDuplicateCheck
-    from app.core.prompts import EVENT_DUPLICATE_CHECK_PROMPT
-
-    ANALYZE_EVENT_COUNT = 5
-
     # 读取质量门控反馋（重试时由 retry_counter 写入）
     feedback = (state.get("supervisor_feedback") or "").strip()
     retry_count = (state.get("retry_count") or {}).get("agent_b_analyze", 0)
     is_retry = retry_count > 0
 
+    focus_events = state.get("focus_events", []) or []
+
     logger.info(
-        f"\n [Node B-Analyze] 启动：深度分析 (必须 {ANALYZE_EVENT_COUNT} 个不同事件)"
+        f"\n [Node B-Analyze] 启动：深度分析 (复用前置圈定事件 {len(focus_events)} 个)"
         f"{f' [第{retry_count}次重试, 反馋: {feedback}]' if is_retry else ''}..."
     )
 
-    all_events = state.get("core_events", [])
+    all_events = focus_events or state.get("core_events", [])
     if not all_events:
         return {"analyzed_events": [], "current_step": "B_Skipped"}
 
     start_date = (state.get("start_date") or "").strip()
     end_date = (state.get("end_date") or "").strip()
 
-    # 初始化去重用的 LLM
-    dedup_llm = ChatOpenAI(
-        model=settings.LLM_MODEL,
-        openai_api_key=settings.ZHIPU_API_KEY,
-        openai_api_base=settings.LLM_BASE_URL,
-        temperature=0.1,
-        request_timeout=60,
-        max_retries=2,
-    )
-    structured_dedup_llm = dedup_llm.with_structured_output(EventDuplicateCheck)
-    dedup_prompt = ChatPromptTemplate.from_template(EVENT_DUPLICATE_CHECK_PROMPT)
-
     # -------------------------------------------------------------------------
-    # 辅助函数：LLM 去重
-    # -------------------------------------------------------------------------
-    def is_duplicate_event_llm(event_name: str, analyzed_names: list) -> bool:
-        if not analyzed_names:
-            return False
-        try:
-            chain = dedup_prompt | structured_dedup_llm
-            result = chain.invoke(
-                {
-                    "current_event": event_name,
-                    "analyzed_events": ", ".join(analyzed_names),
-                }
-            )
-            if result and result.is_same_event:
-                logger.info(
-                    f"    [LLM去重] 跳过重复事件: {event_name}\n"
-                    f"      理由: {result.reasoning}"
-                )
-                return True
-            else:
-                logger.info(f"    [LLM去重] {event_name} 是独立事件")
-                return False
-        except Exception as e:
-            logger.warning(f"    [LLM去重] 调用失败，使用规则兜底: {e}")
-            return is_duplicate_event_simple(event_name, analyzed_names)
-
-    def is_duplicate_event_simple(event_name: str, analyzed_names: list) -> bool:
-        if not analyzed_names:
-            return False
-        event_name_clean = event_name.strip().replace("#", "")
-        for analyzed_name in analyzed_names:
-            analyzed_clean = analyzed_name.strip().replace("#", "")
-            if event_name_clean == analyzed_clean:
-                return True
-            if event_name_clean in analyzed_clean or analyzed_clean in event_name_clean:
-                if abs(len(event_name_clean) - len(analyzed_clean)) <= 5:
-                    return True
-        return False
-
-    # -------------------------------------------------------------------------
-    # 串行深度分析 (LLM 去重 + 确保 5 个不同事件)
+    # 串行深度分析（复用前置圈定后的事件，不再二次去重）
     # -------------------------------------------------------------------------
     analyzed_results = []
-    analyzed_event_names = []
 
     for evt in all_events:
-        if len(analyzed_results) >= ANALYZE_EVENT_COUNT:
-            break
-
         event_name = evt.get("event_name", "未知")
         posts_data = evt.get("_fetched_posts", [])
 
@@ -341,11 +408,8 @@ def agent_b_analyze_node(state: GraphState) -> Dict[str, Any]:
             logger.info(f"    [B-Analyze] 跳过无数据事件: {event_name}")
             continue
 
-        if is_duplicate_event_llm(event_name, analyzed_event_names):
-            continue
-
         logger.info(
-            f"    [B-Analyze] 深度分析: 《{event_name}》 ({len(analyzed_results)+1}/{ANALYZE_EVENT_COUNT})..."
+            f"    [B-Analyze] 深度分析: 《{event_name}》 ({len(analyzed_results)+1}/{len(all_events)})..."
         )
 
         try:
@@ -353,9 +417,13 @@ def agent_b_analyze_node(state: GraphState) -> Dict[str, Any]:
                 {
                     "content": d["content"],
                     "comments": d["comments"],
+                    "comment_items": d.get("comment_items", []),
                     "media_context": d["media_context"],
+                    "liked_count": d.get("liked_count", "0"),
+                    "comments_count": d.get("comments_count", "0"),
+                    "create_date_time": d.get("create_date_time", ""),
                 }
-                for d in posts_data
+                for d in posts_data[:12]
             ]
 
             analyzed_res = agent_opinions.analyze_event(
@@ -369,7 +437,6 @@ def agent_b_analyze_node(state: GraphState) -> Dict[str, Any]:
             if analyzed_res:
                 evt["opinion_report"] = analyzed_res
                 analyzed_results.append(evt)
-                analyzed_event_names.append(event_name)
                 logger.info(f"    [B-Analyze] 完成分析: 《{event_name}》")
 
         except Exception as e:
@@ -387,87 +454,54 @@ def agent_b_analyze_node(state: GraphState) -> Dict[str, Any]:
 # Node C: 合规审查 (Batch 模式 - 完美版)
 # =====================================================
 def agent_c_node(state: GraphState) -> Dict[str, Any]:
-    feedback = (state.get("supervisor_feedback") or "").strip()
-    retry_count = (state.get("retry_count") or {}).get("agent_c", 0)
-    if retry_count > 0:
-        logger.info(
-            f"\n [Node C] 启动：批量合规审查 [第{retry_count}次重试, 反馋: {feedback}]..."
-        )
-    else:
-        logger.info("\n [Node C] 启动：批量合规审查 (复用 B 的全量 200 条数据)...")
+    AUDIT_POSTS_PER_EVENT = 12
+    AUDIT_WORKERS = 8
+    should_force_audit = bool(state.get("force_audit_update", False)) or bool(
+        settings.FORCE_AUDIT_UPDATE
+    )
+    logger.info("\n [Node C] 启动：逐条合规审查（单模型分层审核）...")
 
-    events_with_data = state.get("core_events", [])
-    target_events = events_with_data[:10]
+    focus_events = state.get("focus_events", []) or []
+    target_events = focus_events or (state.get("core_events", []) or [])[:5]
+    logger.info(
+        f"    [Node C] 本轮实际审核事件数：{len(target_events)}（来源：{'focus_events' if focus_events else 'core_events[:5]' }）"
+    )
+    if target_events:
+        logger.info(
+            "    [Node C] 审核事件清单："
+            + "；".join([f"《{e.get('event_name', '未知')}》" for e in target_events])
+        )
 
     # -------------------------------------------------------------------------
     # 辅助函数：单个帖子的审核任务
     # -------------------------------------------------------------------------
     def process_single_audit_task(p, event_name):
         try:
-            #  【修改】处理已审核过的帖子
-            if not settings.FORCE_AUDIT_UPDATE and p.get("audit_status") == "completed":
-                # 如果数据库里已经是违规状态，我们需要把它加回本次报告中
+            if not should_force_audit and p.get("audit_status") == "completed":
                 if p.get("is_violation") is True:
                     existing_info = p.get("violation_info") or {}
-                    # 构造与新审核一致的返回结构
+                    repaired_info = agent_c.repair_existing_violation_info(
+                        existing_info
+                    )
+                    repaired_is_violation = bool(
+                        repaired_info.get("post_case")
+                        or (repaired_info.get("comment_cases") or [])
+                    )
                     return {
                         "post": p,
                         "event_name": event_name,
-                        "is_violation": True,
-                        "violation_info": existing_info,
-                        "comment_items": p.get("comment_items", []),
-                        # 注意：这里需要确保 p 里有 comment_items，或者从 p['comments'] 还原
-                        # 如果 existing_info 里有 violated_comments，报告生成器就能用
-                        "violated_comments": existing_info.get("violated_comments", []),
+                        "is_violation": repaired_is_violation,
+                        "violation_info": repaired_info,
+                        "audit_comment_items": p.get("audit_comment_items", []),
                     }
-                else:
-                    # 既已完成又是安全的，则本次报告直接忽略
-                    return None
-
-            # 这里的 comments 是全量 200 条（同时保留评论 _id 用于回写）
-            comment_items = p.get("comment_items") or []
-            comments_text_block = "\n".join(
-                [
-                    f"{idx}. {(it.get('content','') or '')}"
-                    for idx, it in enumerate(comment_items)
-                ]
-            )
-
-            #  Batch + RAG：一次审查 + 标签检索法规 + 证据链
-            rag_payload = agent_c.batch_audit_with_rag(
-                post_content=p["content"],
-                comments_text=comments_text_block,
-                media_context=p["media_context"],
-                note_id=p["note_id"],
-            )
-
-            batch_res = rag_payload.get("batch_result", {})
-            matched_laws = rag_payload.get("matched_laws", [])
-            evidence_report = rag_payload.get("evidence_report", {})
-
-            # 简化模式审查结果直接视为安全
-            # （无需特殊标记，正常流程处理）
-
-            # 统一写回结构
-            violation_info = {
-                **(batch_res or {}),
-                "matched_laws": matched_laws,
-                "evidence_report": evidence_report,
-            }
-
-            is_violation = bool(
-                batch_res.get("is_post_violated")
-                or (batch_res.get("violated_comments") or [])
-            )
-
-            # 返回结果包
+                return None
+            audit_payload = agent_c.audit_post_packet(p, event_name=event_name)
             return {
                 "post": p,
                 "event_name": event_name,
-                "is_violation": is_violation,
-                "violation_info": violation_info,
-                "comment_items": comment_items,
-                "violated_comments": batch_res.get("violated_comments") or [],
+                "is_violation": audit_payload.get("is_violation", False),
+                "violation_info": audit_payload.get("violation_info", {}),
+                "audit_comment_items": p.get("audit_comment_items", []),
             }
         except Exception as e:
             logger.error(f" [Node C] 帖子审核失败 ({p.get('note_id')}): {e}")
@@ -479,7 +513,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     tasks = []
     for event in target_events:
         event_name = event.get("event_name", "未知")
-        posts = event.get("_fetched_posts", [])
+        posts = (event.get("_fetched_posts", []) or [])[:AUDIT_POSTS_PER_EVENT]
         if not posts:
             continue
 
@@ -496,8 +530,8 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
     post_audit_updates = []
     comment_audit_updates = []
 
-    # 同样控制并发数，Agent C 比较耗费 token 和计算，建议适中 (例如 3)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    # mini 模型场景下恢复较高审核并发，保留轻量 timeout/fallback 机制兜底。
+    with concurrent.futures.ThreadPoolExecutor(max_workers=AUDIT_WORKERS) as executor:
         futures = [
             executor.submit(process_single_audit_task, p, ename) for p, ename in tasks
         ]
@@ -510,12 +544,10 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
             p = res["post"]
             is_violation = res["is_violation"]
             violation_info = res["violation_info"]
-            comment_items = res["comment_items"]
-            violated_comments = res["violated_comments"]
+            comment_items = res.get("audit_comment_items") or []
+            comment_cases = violation_info.get("comment_cases") or []
+            post_case = violation_info.get("post_case")
 
-            # --- 组装写回数据 ---
-
-            # A. 帖子回写
             post_audit_updates.append(
                 {
                     "id": p["db_id"],
@@ -524,13 +556,11 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                 }
             )
 
-            # B. 评论回写
             violated_map = {}
-            for v_item in violated_comments:
+            for v_item in comment_cases:
                 try:
-                    v_idx = int(v_item.get("index"))
-                    violated_map[v_idx] = v_item
-                except:
+                    violated_map[int(v_item.get("index"))] = v_item
+                except Exception:
                     continue
 
             for idx, c_item in enumerate(comment_items):
@@ -544,12 +574,7 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                         {
                             "id": c_db_id,
                             "is_violation": True,
-                            "violation_info": {
-                                "index": idx,
-                                "note_id": p.get("note_id"),
-                                "item": v_detail,
-                                "matched_laws": violation_info.get("matched_laws"),
-                            },
+                            "violation_info": v_detail,
                         }
                     )
                 else:
@@ -561,26 +586,22 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                         }
                     )
 
-            # C. 记录违规结果到 state
             if is_violation:
-                #  重构：保存原始帖子内容和违规评论原文，用于报告展示
                 violated_comment_texts = []
-                for v_item in violated_comments:
+                for case in comment_cases:
                     try:
-                        v_idx = int(v_item.get("index", -1))
-                        if 0 <= v_idx < len(comment_items):
-                            original_text = comment_items[v_idx].get("content", "")
-                            violated_comment_texts.append(
-                                {
-                                    "index": v_idx,
-                                    "content": original_text,
-                                    "category": v_item.get("category", ""),
-                                    "risk_level": v_item.get("risk_level", ""),
-                                }
-                            )
-                    except:
-                        continue
-
+                        index = int(case.get("index", -1))
+                    except Exception:
+                        index = -1
+                    if 0 <= index < len(comment_items):
+                        violated_comment_texts.append(
+                            {
+                                "index": index,
+                                "content": comment_items[index].get("content", ""),
+                                "category": case.get("category", ""),
+                                "risk_level": case.get("risk_level", "Low"),
+                            }
+                        )
                 audit_results.append(
                     {
                         "event_name": res["event_name"],
@@ -588,9 +609,10 @@ def agent_c_node(state: GraphState) -> Dict[str, Any]:
                         "db_id": p["db_id"],
                         "is_violation": True,
                         "violation_info": violation_info,
-                        #  新增：保存原始内容
-                        "post_content": p.get("content", ""),  # 帖子原文
-                        "violated_comment_originals": violated_comment_texts,  # 违规评论原文
+                        "post_content": p.get("content", ""),
+                        "post_case": post_case,
+                        "comment_cases": comment_cases,
+                        "violated_comment_originals": violated_comment_texts,
                     }
                 )
 
@@ -643,164 +665,83 @@ def agent_historical_node(state: GraphState) -> Dict[str, Any]:
 # Node D: 趋势预测 (ReAct Agent 模式)
 # =====================================================
 def agent_d_node(state: GraphState) -> Dict[str, Any]:
-    """
-    Agent D: 趋势预测 (ReAct Agent 模式)
-
-    Agent 自主构造搜索词，但 Prompt 约束时间与领域格式
-    """
-    from app.agents.factory import create_agent
-    from app.services.utils import tavily_search
-    from app.core.prompts import AGENT_D_REACT_SYSTEM_PROMPT
-    from langchain_core.messages import HumanMessage
-    import re
-    import json as json_module
-
     feedback = (state.get("supervisor_feedback") or "").strip()
     retry_count = (state.get("retry_count") or {}).get("agent_d", 0)
     is_retry = retry_count > 0
 
     logger.info(
-        f"\n [Node D] 启动：趋势研判 (ReAct Mode)"
+        f"\n [Node D] 启动：趋势研判 (Fixed Search + Structured Forecast)"
         f"{f' [第{retry_count}次重试, 反馈: {feedback}]' if is_retry else ''}..."
     )
 
-    # ----------------------------------------------------------------
-    # 公共数据准备
-    # ----------------------------------------------------------------
     analyzed_events = state.get("analyzed_events", [])
     audit_results = state.get("audit_results", [])
     category = state.get("category") or "综合"
     forecast_range = state.get("forecast_range") or "1m"
 
-    # 准备当前舆情摘要
-    b_texts = []
-    for evt in analyzed_events:
-        r = evt.get("opinion_report", {})
-        if isinstance(r, dict):
-            b_texts.append(
-                f"【事件】{evt.get('event_name')}\n【概况】{r.get('event_overview')}"
-            )
-    opinion_str = "\n---\n".join(b_texts) if b_texts else "无数据"
-
-    c_texts = []
-    for r in audit_results:
-        v = r.get("violation_info", {})
-        c_texts.append(
-            f"事件<{r.get('event_name','未知')}>: 风险[{v.get('overall_risk_level')}]"
+    deep_read_briefs = []
+    for evt in analyzed_events[:5]:
+        report = evt.get("opinion_report") or {}
+        deep_read_briefs.append(
+            "\n".join(
+                [
+                    f"【事件】{evt.get('event_name', '未知事件')}",
+                    f"【一句话判断】{report.get('one_line_verdict') or report.get('event_overview') or ''}",
+                    f"【观点摘要】{'；'.join((report.get('public_opinions') or [])[:2])}",
+                    f"【关键引述】{'；'.join((report.get('key_quotes') or [])[:2])}",
+                ]
+            ).strip()
         )
-    audit_str = "\n".join(c_texts) if c_texts else "无高风险"
-
-    # ----------------------------------------------------------------
-    # 计算目标时间段描述
-    # ----------------------------------------------------------------
-    range_map = {
-        "1w": ("未来一周", 7, "days"),
-        "2w": ("未来两周", 14, "days"),
-        "1m": ("未来一个月", 1, "months"),
-        "2m": ("未来两个月", 2, "months"),
-    }
-    range_desc, delta_val, delta_unit = range_map.get(
-        forecast_range, ("未来一个月", 1, "months")
-    )
-    now = datetime.now()
-
-    if delta_unit == "days":
-        target_date = now + timedelta(days=delta_val)
-    else:
-        target_date = now + relativedelta(months=delta_val)
-
-    target_period = f"{now.strftime('%Y年%m月%d日')}至{target_date.strftime('%Y年%m月%d日')}（{range_desc}）"
-
-    logger.info(f"   🌍 [Node D] 研判周期: {target_period}, 领域: {category}")
-
-    # ----------------------------------------------------------------
-    # 创建 ReAct Agent
-    # ----------------------------------------------------------------
-    llm = ChatOpenAI(
-        model=settings.LLM_MODEL,
-        openai_api_key=settings.ZHIPU_API_KEY,
-        openai_api_base=settings.LLM_BASE_URL,
-        temperature=0.6,
-        request_timeout=180,
-        max_retries=3,
+    opinion_str = (
+        "\n\n".join([text for text in deep_read_briefs if text]) or "无重点深读摘要"
     )
 
-    system_prompt = AGENT_D_REACT_SYSTEM_PROMPT.format(
-        target_period=target_period,
+    risk_priority = {"High": 3, "Medium": 2, "Low": 1}
+    sorted_audits = sorted(
+        audit_results,
+        key=lambda item: risk_priority.get(
+            ((item.get("violation_info") or {}).get("overall_risk_level") or "Low"), 1
+        ),
+        reverse=True,
+    )
+    audit_briefs = []
+    for item in sorted_audits[:5]:
+        info = item.get("violation_info") or {}
+        top_categories = []
+        for case in (info.get("comment_cases") or [])[:2]:
+            category_name = case.get("category")
+            if category_name and category_name not in top_categories:
+                top_categories.append(category_name)
+        representative_quotes = [
+            case.get("quote", "")
+            for case in (info.get("comment_cases") or [])[:2]
+            if case.get("quote")
+        ]
+        audit_briefs.append(
+            "\n".join(
+                [
+                    f"【事件】{item.get('event_name', '未知事件')}",
+                    f"【风险等级】{info.get('overall_risk_level', 'Low')}",
+                    f"【主要类别】{'、'.join(top_categories) or '未标注'}",
+                    f"【代表性表达】{'；'.join(representative_quotes) or '无'}",
+                ]
+            ).strip()
+        )
+    audit_str = "\n\n".join(audit_briefs) or "无明显违规风险摘要"
+
+    forecast = agent_forecast.run(
+        current_opinion_analysis=opinion_str,
+        audit_risks=audit_str,
+        forecast_range=forecast_range,
         category=category,
-        current_date=now.strftime("%Y年%m月%d日"),
+        improvement_hint=feedback if is_retry else "",
     )
 
-    agent = create_agent(
-        model=llm,
-        tools=[tavily_search],
-        system_prompt=system_prompt,
+    logger.info(
+        f"   [Node D] 固定流程预测完成，生成 {len(forecast.get('topics', []))} 个预测主题"
     )
-
-    # ----------------------------------------------------------------
-    # 执行 Agent
-    # ----------------------------------------------------------------
-    user_message = f"""
-请为【{category}领域】的【{target_period}】进行舆情风险预测。
-
-当前舆论情绪摘要：
-{opinion_str}
-
-已核实违规风险：
-{audit_str}
-
-{'【改进建议】' + feedback if is_retry else ''}
-"""
-
-    try:
-        # 添加 recursion_limit 防止无限循环
-        result = agent.invoke(
-            {"messages": [HumanMessage(content=user_message)]}, {"recursion_limit": 10}
-        )
-
-        # 从最后一条消息提取 JSON
-        last_message = result["messages"][-1]
-        forecast = _extract_json_from_agent_message(last_message.content)
-
-        # 确保 target_period 有值
-        if not forecast.get("target_period"):
-            forecast["target_period"] = target_period
-
-        logger.info(
-            f"   [Node D] ReAct Agent 完成，生成 {len(forecast.get('topics', []))} 个预测主题"
-        )
-
-    except Exception as e:
-        logger.error(f"[Node D] ReAct Agent 执行失败: {e}")
-        # 降级：返回空预测结构，标记错误以便 quality_gate 判断
-        forecast = {"target_period": target_period, "topics": [], "_error": str(e)}
 
     return {"trend_forecast": forecast, "current_step": "D_Done"}
-
-
-def _extract_json_from_agent_message(content: str) -> dict:
-    """从 Agent 输出中提取 JSON"""
-    import re
-    import json
-
-    # 尝试匹配 JSON 代码块
-    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except:
-            pass
-
-    # 尝试匹配裸 JSON 对象
-    obj_match = re.search(r"\{[\s\S]*\}", content)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group())
-        except:
-            pass
-
-    # 兜底返回空结构
-    return {"target_period": "", "topics": []}
 
 
 # =====================================================
@@ -819,9 +760,15 @@ def agent_e_node(state: GraphState) -> Dict[str, Any]:
             "created_at": datetime.now(),
             "category": state.get("category", "综合"),
             "md_path": output.get("md_path", ""),
+            "json_path": output.get("json_path", ""),
+            "html_path": output.get("html_path", ""),
+            "pdf_path": output.get("pdf_path", ""),
             "report_markdown": output.get("markdown", ""),
+            "report_json": output.get("report_json", {}),
             "trend_forecast": state.get("trend_forecast", {}),
             "core_events": state.get("core_events", []),
+            "analyzed_events": state.get("analyzed_events", []),
+            "audit_results": state.get("audit_results", []),
             "violation_stats": output.get("violation_stats", {}),
         }
         mongo_db.save_report_session(session_data)
@@ -832,6 +779,7 @@ def agent_e_node(state: GraphState) -> Dict[str, Any]:
     logger.info(f" 报告文件: {output.get('md_path')}")
     return {
         "final_report": output.get("markdown", ""),
+        "report_json": output.get("report_json", {}),
         "violation_stats": output.get("violation_stats", {}),
         "current_step": "E_Done",
     }

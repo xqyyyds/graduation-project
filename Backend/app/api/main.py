@@ -7,6 +7,7 @@ import os
 import glob
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, List
 from pathlib import Path
@@ -21,6 +22,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 # 导入工作流
@@ -31,6 +33,12 @@ from main import run_task
 
 #  新增导入 mongo_db，用于获取违规统计
 from app.db.mongo_manager import mongo_db
+from app.core.config import settings
+from app.core.llm_factory import resolve_llm_config
+from app.core.progress import build_progress_payload
+from app.services.render_html import render_report_html, save_report_html
+from app.services.render_pdf import save_report_pdf
+from app.services.report import render_markdown_from_report_doc
 
 app = FastAPI(
     title="舆情研判系统 API",
@@ -41,7 +49,7 @@ app = FastAPI(
 # CORS 配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=settings.CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -134,6 +142,7 @@ class TaskCreate(BaseModel):
     end_date: Optional[str] = None
     category: str = "综合"
     forecast_range: str = "1m"
+    force_audit_update: bool = False
 
 
 class TaskStatus(BaseModel):
@@ -144,6 +153,9 @@ class TaskStatus(BaseModel):
     progress: int  # 0-100
     current_step: str
     message: str
+    stage_id: Optional[str] = None
+    stage_label: Optional[str] = None
+    stage_progress: Optional[int] = None
     start_time: Optional[int] = None  # 毫秒时间戳
     end_time: Optional[int] = None  # 毫秒时间戳（任务完成或失败时写入）
 
@@ -177,18 +189,24 @@ class DashboardStats(BaseModel):
 task_store = {}
 
 
+def _task_progress_state(stage_id: str, stage_progress: int, message: str) -> dict:
+    payload = build_progress_payload(stage_id, stage_progress, message)
+    return {
+        "progress": payload["overall_progress"],
+        "current_step": payload["stage_label"],
+        "message": payload["message"],
+        "stage_id": payload["stage_id"],
+        "stage_label": payload["stage_label"],
+        "stage_progress": payload["stage_progress"],
+    }
+
+
 def update_task_progress(task_id: str, progress: int, step: str, message: str):
     """更新任务进度（供外部调用），保留已有 start_time/end_time 字段"""
     if task_id in task_store:
         existing = dict(task_store.get(task_id, {}))
-        existing.update(
-            {
-                "status": "running",
-                "progress": progress,
-                "current_step": step,
-                "message": message,
-            }
-        )
+        existing.update({"status": "running"})
+        existing.update(_task_progress_state(step, progress, message))
         task_store[task_id] = existing
 
 
@@ -197,41 +215,46 @@ async def execute_task(task_id: str, params: TaskCreate):
     try:
         task_store[task_id] = {
             "status": "running",
-            "progress": 5,
-            "current_step": "初始化",
-            "message": "正在启动任务...",
             # 记录任务启动时间（毫秒）用于前端计时与回放
             "start_time": int(datetime.now().timestamp() * 1000),
+            **_task_progress_state("prepare", 0, "正在启动任务..."),
         }
         add_system_log("INFO", f" 任务 {task_id} 开始执行")
 
         # 定义进度回调函数
-        def progress_callback(progress: int, step: str, message: str):
+        def progress_callback(payload: dict):
             # 合并更新，保留 start_time/end_time 等元数据
             existing = dict(task_store.get(task_id, {}))
             existing.update(
                 {
                     "status": "running",
-                    "progress": progress,
-                    "current_step": step,
-                    "message": message,
+                    "progress": payload["overall_progress"],
+                    "current_step": payload["stage_label"],
+                    "message": payload["message"],
+                    "stage_id": payload["stage_id"],
+                    "stage_label": payload["stage_label"],
+                    "stage_progress": payload["stage_progress"],
                 }
             )
             task_store[task_id] = existing
             # 同时记录到日志
-            add_system_log("INFO", f"[{step}] {message} ({progress}%)")
+            add_system_log(
+                "INFO",
+                f"[{payload['stage_label']}] {payload['message']} ({payload['overall_progress']}%)",
+            )
 
         # 注意：run_task 是同步、耗时的阻塞函数，不能在事件循环中直接调用。
         # 使用 asyncio.to_thread 将其移到线程池执行，避免阻塞 FastAPI
         await asyncio.to_thread(
             run_task,
-            task_id,
-            params.start_date,
-            params.end_date,
-            False,
-            params.forecast_range,
-            params.category,
-            progress_callback,  # 传递进度回调
+            thread_id=task_id,
+            start_date=params.start_date,
+            end_date=params.end_date,
+            regenerate_report=False,
+            forecast_range=params.forecast_range,
+            category=params.category,
+            force_audit_update=params.force_audit_update,
+            progress_callback=progress_callback,  # 传递进度回调
         )
 
         # 合并更新，保留 start_time 等元数据，并写入 end_time
@@ -239,10 +262,8 @@ async def execute_task(task_id: str, params: TaskCreate):
         existing.update(
             {
                 "status": "completed",
-                "progress": 100,
-                "current_step": "完成",
-                "message": "报告生成成功",
                 "end_time": int(datetime.now().timestamp() * 1000),
+                **_task_progress_state("done", 100, "报告生成成功"),
             }
         )
         task_store[task_id] = existing
@@ -252,10 +273,8 @@ async def execute_task(task_id: str, params: TaskCreate):
         existing.update(
             {
                 "status": "failed",
-                "progress": 0,
-                "current_step": "错误",
-                "message": str(e),
                 "end_time": int(datetime.now().timestamp() * 1000),
+                **_task_progress_state("report", 100, str(e)),
             }
         )
         task_store[task_id] = existing
@@ -374,28 +393,31 @@ async def get_dashboard_stats():
 async def create_task(params: TaskCreate, background_tasks: BackgroundTasks):
     """创建新的研判任务"""
     # 生成任务ID
-    today = datetime.now().strftime("%Y%m%d_%H%M")
-    task_id = f"task_{today}"
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:4]
+    task_id = f"task_{now}_{suffix}"
 
     # 添加后台任务
     background_tasks.add_task(execute_task, task_id, params)
 
     start_ts = int(datetime.now().timestamp() * 1000)
+    task_progress = _task_progress_state("prepare", 0, "任务已创建，正在排队...")
     task_store[task_id] = {
         "status": "running",
-        "progress": 0,
-        "current_step": "初始化",
-        "message": "任务已创建，正在排队...",
         # 记录任务启动时间（毫秒）用于前端计时冻结
         "start_time": start_ts,
+        **task_progress,
     }
 
     return TaskStatus(
         task_id=task_id,
         status="running",
-        progress=0,
-        current_step="初始化",
+        progress=task_progress["progress"],
+        current_step=task_progress["current_step"],
         message="任务已创建",
+        stage_id=task_progress["stage_id"],
+        stage_label=task_progress["stage_label"],
+        stage_progress=task_progress["stage_progress"],
         start_time=start_ts,
     )
 
@@ -433,15 +455,162 @@ async def get_report_content(filename: str):
     return {"filename": filename, "content": content}
 
 
-@app.get("/api/reports/{filename}/download")
-async def download_report(filename: str):
-    """下载报告文件"""
-    file_path = OUTPUT_DIR / filename
+def _resolve_artifact_path(filename: str, suffix: str) -> Path:
+    return (OUTPUT_DIR / filename).with_suffix(suffix)
+
+
+def _load_report_session(filename: str) -> Optional[dict]:
+    try:
+        return mongo_db.get_report_session_by_filename(filename)
+    except Exception:
+        return None
+
+
+def _load_report_json_or_none(filename: str) -> Optional[dict]:
+    file_path = _resolve_artifact_path(filename, ".json")
+    if file_path.exists():
+        import json
+
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    session = _load_report_session(filename) or {}
+    report_json = session.get("report_json")
+    if isinstance(report_json, dict) and report_json:
+        return report_json
+    return None
+
+
+def _materialize_report_artifact(filename: str, format: str) -> Optional[Path]:
+    report_json = _load_report_json_or_none(filename)
+    if not report_json:
+        return None
+
+    target_map = {
+        "md": OUTPUT_DIR / filename,
+        "json": _resolve_artifact_path(filename, ".json"),
+        "html": _resolve_artifact_path(filename, ".html"),
+        "pdf": _resolve_artifact_path(filename, ".pdf"),
+    }
+    target_path = target_map[format]
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if format == "md":
+            target_path.write_text(
+                render_markdown_from_report_doc(report_json), encoding="utf-8"
+            )
+        elif format == "json":
+            import json
+
+            with open(target_path, "w", encoding="utf-8") as file:
+                json.dump(report_json, file, ensure_ascii=False, indent=2)
+        elif format == "html":
+            save_report_html(report_json, str(target_path))
+        elif format == "pdf":
+            save_report_pdf(report_json, str(target_path))
+    except OSError:
+        return None
+
+    return target_path if target_path.exists() else None
+
+
+@app.get("/api/reports/{filename}/json")
+async def get_report_json(filename: str):
+    report_json = _load_report_json_or_none(filename)
+    if not report_json:
+        raise HTTPException(status_code=404, detail="结构化报告不存在")
+    return JSONResponse(content=report_json)
+
+
+@app.get("/api/reports/{filename}/html")
+async def get_report_html(filename: str):
+    file_path = _resolve_artifact_path(filename, ".html")
+
+    if file_path.exists():
+        return FileResponse(
+            path=file_path, filename=file_path.name, media_type="text/html"
+        )
+
+    report_json = _load_report_json_or_none(filename)
+    if not report_json:
+        raise HTTPException(status_code=404, detail="HTML 报告不存在")
+    return HTMLResponse(content=render_report_html(report_json))
+
+
+@app.get("/api/reports/{filename}/pdf")
+async def get_report_pdf(filename: str):
+    file_path = _resolve_artifact_path(filename, ".pdf")
 
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="报告不存在")
+        file_path = _materialize_report_artifact(filename, "pdf")
+        if not file_path:
+            raise HTTPException(status_code=404, detail="PDF 报告不存在")
 
-    return FileResponse(path=file_path, filename=filename, media_type="text/markdown")
+    return FileResponse(
+        path=file_path, filename=file_path.name, media_type="application/pdf"
+    )
+
+
+@app.get("/api/reports/{filename}/artifacts")
+async def get_report_artifacts(filename: str):
+    session = _load_report_session(filename) or {}
+    session_has_report = isinstance(session.get("report_json"), dict) and bool(
+        session.get("report_json")
+    )
+    return {
+        "markdown": (OUTPUT_DIR / filename).exists()
+        or session_has_report
+        or bool(session.get("report_markdown")),
+        "json": _resolve_artifact_path(filename, ".json").exists()
+        or session_has_report,
+        "html": _resolve_artifact_path(filename, ".html").exists()
+        or session_has_report,
+        "pdf": _resolve_artifact_path(filename, ".pdf").exists() or session_has_report,
+        "render_version": session.get("render_version")
+        or ((session.get("report_json") or {}).get("meta") or {}).get("render_version"),
+    }
+
+
+@app.get("/api/reports/{filename}/download")
+async def download_report(filename: str, format: str = "md"):
+    """下载报告文件"""
+    file_map = {
+        "md": (OUTPUT_DIR / filename, "text/markdown"),
+        "json": (_resolve_artifact_path(filename, ".json"), "application/json"),
+        "html": (_resolve_artifact_path(filename, ".html"), "text/html"),
+        "pdf": (_resolve_artifact_path(filename, ".pdf"), "application/pdf"),
+    }
+    file_path, media_type = file_map.get(
+        format, (OUTPUT_DIR / filename, "text/markdown")
+    )
+
+    if format == "html" and not file_path.exists():
+        report_json = _load_report_json_or_none(filename)
+        if report_json:
+            return HTMLResponse(content=render_report_html(report_json))
+
+    if not file_path.exists():
+        generated = _materialize_report_artifact(
+            filename, format if format in file_map else "md"
+        )
+        if generated:
+            file_path = generated
+        elif format == "md":
+            session = _load_report_session(filename) or {}
+            markdown = session.get("report_markdown")
+            if markdown:
+                return PlainTextResponse(content=markdown, media_type="text/markdown")
+            raise HTTPException(status_code=404, detail="报告不存在")
+        elif format == "html":
+            report_json = _load_report_json_or_none(filename)
+            if report_json:
+                return HTMLResponse(content=render_report_html(report_json))
+            raise HTTPException(status_code=404, detail="报告不存在")
+        else:
+            raise HTTPException(status_code=404, detail="报告不存在")
+
+    return FileResponse(path=file_path, filename=file_path.name, media_type=media_type)
 
 
 @app.delete("/api/reports/{filename}")
@@ -454,6 +623,10 @@ async def delete_report(filename: str):
 
     try:
         file_path.unlink()
+        for suffix in [".json", ".html", ".pdf"]:
+            artifact = _resolve_artifact_path(filename, suffix)
+            if artifact.exists():
+                artifact.unlink()
         return {"status": "ok", "message": f"报告 {filename} 已删除"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
@@ -552,15 +725,14 @@ async def get_forecast_ranges():
 # =====================================================
 
 
-from typing import Optional
+class LLMConfigInput(BaseModel):
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
 
 
-class LLMSettings(BaseModel):
-    """LLM 配置"""
-
-    model: str
-    base_url: str
-    api_key: str
+class LLMSettingsPayload(BaseModel):
+    main: LLMConfigInput
 
 
 class LLMTestParams(BaseModel):
@@ -571,66 +743,107 @@ class LLMTestParams(BaseModel):
     api_key: Optional[str] = None
 
 
+class SearchSettingsPayload(BaseModel):
+    tavily_api_key: str = ""
+
+
+class SearchTestParams(BaseModel):
+    tavily_api_key: Optional[str] = None
+
+
+def _mask_api_key(api_key: str) -> str:
+    if not api_key:
+        return ""
+    if len(api_key) > 10:
+        return api_key[:6] + "*" * (len(api_key) - 10) + api_key[-4:]
+    return "****"
+
+
+def _save_tavily_api_key(api_key: str):
+    if api_key and "*" not in api_key:
+        settings.TAVILY_API_KEY = api_key
+        os.environ["TAVILY_API_KEY"] = api_key
+
+
+def _sync_legacy_llm_settings_from_main(config: LLMConfigInput):
+    if config.model:
+        settings.LLM_MODEL = config.model
+        os.environ["LLM_MODEL"] = config.model
+    if config.base_url:
+        settings.LLM_BASE_URL = config.base_url
+        os.environ["LLM_BASE_URL"] = config.base_url
+    if config.api_key and "*" not in config.api_key:
+        settings.ZHIPU_API_KEY = config.api_key
+        os.environ["ZHIPU_API_KEY"] = config.api_key
+
+
+def _save_main_llm_config(config: Optional[LLMConfigInput]):
+    if not config:
+        return
+    if config.model:
+        settings.FAST_LLM_MODEL = config.model
+        os.environ["FAST_LLM_MODEL"] = config.model
+    if config.base_url:
+        settings.FAST_LLM_BASE_URL = config.base_url
+        os.environ["FAST_LLM_BASE_URL"] = config.base_url
+    if config.api_key and "*" not in config.api_key:
+        settings.FAST_LLM_API_KEY = config.api_key
+        os.environ["FAST_LLM_API_KEY"] = config.api_key
+
+
+def _clear_legacy_strong_llm_env():
+    os.environ.pop("STRONG_LLM_MODEL", None)
+    os.environ.pop("STRONG_LLM_BASE_URL", None)
+    os.environ.pop("STRONG_LLM_API_KEY", None)
+
+
 @app.get("/api/settings/llm")
 async def get_llm_settings():
     """获取当前 LLM 设置（API Key 部分隐藏）"""
-    from app.core.config import settings
-
-    # 隐藏 API Key 中间部分
-    api_key = settings.ZHIPU_API_KEY
-    if len(api_key) > 10:
-        masked_key = api_key[:6] + "*" * (len(api_key) - 10) + api_key[-4:]
-    else:
-        masked_key = "****"
+    main_config = resolve_llm_config()
     return {
-        "model": settings.LLM_MODEL,
-        "base_url": settings.LLM_BASE_URL,
-        "api_key": masked_key,
+        "main": {
+            "model": main_config.model,
+            "base_url": main_config.base_url,
+            "api_key": _mask_api_key(main_config.api_key),
+        },
+        "single_llm_mode": True,
+        "persistence_mode": "runtime",
     }
 
 
 @app.post("/api/settings/llm")
-async def update_llm_settings(llm_settings: LLMSettings):
-    """更新 LLM 设置（写入环境变量，重启后生效）"""
-    import os
-    from app.core.config import settings
+async def update_llm_settings(llm_settings: LLMSettingsPayload):
+    """更新 LLM 设置（运行时生效，服务重启后需重新加载）"""
+    _save_main_llm_config(llm_settings.main)
+    _clear_legacy_strong_llm_env()
+    _sync_legacy_llm_settings_from_main(llm_settings.main)
 
-    # 更新运行时配置
-    if llm_settings.model:
-        settings.LLM_MODEL = llm_settings.model
-        os.environ["LLM_MODEL"] = llm_settings.model
-
-    if llm_settings.base_url:
-        settings.LLM_BASE_URL = llm_settings.base_url
-        os.environ["LLM_BASE_URL"] = llm_settings.base_url
-
-    # 只有非掩码的 API Key 才更新
-    if llm_settings.api_key and "*" not in llm_settings.api_key:
-        settings.ZHIPU_API_KEY = llm_settings.api_key
-        os.environ["ZHIPU_API_KEY"] = llm_settings.api_key
-
-    return {"status": "ok", "message": "LLM 设置已更新"}
+    return {
+        "status": "ok",
+        "message": "LLM 设置已更新（当前为单模型模式；运行时保存，服务重启后需重新加载）",
+        "single_llm_mode": True,
+        "persistence_mode": "runtime",
+    }
 
 
 @app.post("/api/settings/llm/test")
 async def test_llm_connection(params: LLMTestParams):
     """测试 LLM 连接。优先使用传入参数，否则退回到当前 server 配置。增强：先使用 openai SDK 做一次简单请求以捕获认证/地址错误，失败则回退到 langchain 的调用，同时对返回内容做基本检查。"""
-    from app.core.config import settings
-
-    # 决定使用的配置（传入优先）
-    model = params.model or settings.LLM_MODEL
-    base_url = params.base_url or settings.LLM_BASE_URL
+    resolved = resolve_llm_config()
+    model = params.model or resolved.model
+    base_url = params.base_url or resolved.base_url
     api_key = (
         params.api_key
         if params.api_key and "*" not in params.api_key
-        else settings.ZHIPU_API_KEY
+        else resolved.api_key
     )
 
     # 记录收到的参数（不记录完整密钥以防泄漏）
     from app.core.logger import logger
 
     logger.info(
-        f"LLM 测试请求: model={model}, base_url={'(present)' if base_url else '(none)'}, api_key_present={'yes' if api_key else 'no'}"
+        f"LLM 测试请求: mode=single, model={model}, base_url={'(present)' if base_url else '(none)'}, api_key_present={'yes' if api_key else 'no'}"
     )
 
     # 1) 尝试使用 openai SDK (v1.x+) 发起最小化请求以捕获常见错误
@@ -705,6 +918,60 @@ async def test_llm_connection(params: LLMTestParams):
         return {
             "status": "error",
             "message": f"连接失败: openai_error: {openai_err}; fallback_error: {str(e_chain)}",
+        }
+
+
+@app.get("/api/settings/search")
+async def get_search_settings():
+    return {
+        "tavily_api_key": _mask_api_key(settings.TAVILY_API_KEY),
+        "persistence_mode": "runtime",
+    }
+
+
+@app.post("/api/settings/search")
+async def update_search_settings(search_settings: SearchSettingsPayload):
+    _save_tavily_api_key(search_settings.tavily_api_key)
+    return {
+        "status": "ok",
+        "message": "联网搜索设置已更新（当前为运行时保存，服务重启后需重新加载）",
+        "persistence_mode": "runtime",
+    }
+
+
+@app.post("/api/settings/search/test")
+async def test_search_connection(params: SearchTestParams):
+    api_key = (
+        params.tavily_api_key
+        if params.tavily_api_key and "*" not in params.tavily_api_key
+        else settings.TAVILY_API_KEY
+    )
+
+    if not api_key:
+        return {"status": "error", "message": "未配置 Tavily API Key"}
+
+    try:
+        from tavily import TavilyClient
+
+        client = TavilyClient(api_key=api_key)
+        response = client.search(
+            query="中国 今日 新闻",
+            search_depth="basic",
+            max_results=1,
+            topic="news",
+            include_answer=False,
+            include_raw_content=False,
+        )
+        results = response.get("results", []) if isinstance(response, dict) else []
+        return {
+            "status": "ok",
+            "message": "Tavily 连接成功",
+            "result_count": len(results),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Tavily 连接失败: {str(exc)}",
         }
 
 

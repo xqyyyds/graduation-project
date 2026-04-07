@@ -1,2 +1,1 @@
-# app/services/__init__.py
-"""服务模块"""
+"""Business services for the report system."""

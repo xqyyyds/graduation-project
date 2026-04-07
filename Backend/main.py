@@ -2,6 +2,7 @@ import uuid
 import datetime
 import argparse
 import sys
+from app.core.progress import build_progress_payload
 
 # 1. 引入记忆管理器 (Checkpointer)
 from app.db.checkpointer import checkpointer_manager
@@ -18,6 +19,7 @@ def run_task(
     regenerate_report: bool = False,
     forecast_range: str = "1m",
     category: str = "综合",
+    force_audit_update: bool = False,
     progress_callback=None,
 ):
     """
@@ -28,14 +30,16 @@ def run_task(
     :param regenerate_report: 是否仅重新生成报告 (跳过前面的步骤)
     :param forecast_range: 趋势预测时间范围 (1w/2w/1m/2m)
     :param category: 热搜类别筛选 (综合/社会/高校/生活/科技/政治/其他)
-    :param progress_callback: 进度回调函数 (progress, step, message)
+    :param force_audit_update: 是否强制重审（忽略历史审核缓存）
+    :param progress_callback: 进度回调函数 (payload)
     """
 
-    def report_progress(progress: int, step: str, message: str):
+    def report_progress(stage_id: str, stage_progress: int, message: str):
         """报告进度"""
+        payload = build_progress_payload(stage_id, stage_progress, message)
         if progress_callback:
-            progress_callback(progress, step, message)
-        print(f" [{progress}%] {step}: {message}")
+            progress_callback(payload)
+        print(f" [{payload['overall_progress']}%] {payload['stage_label']}: {message}")
 
     # --- 1. ID 初始化 ---
     if not thread_id:
@@ -47,7 +51,7 @@ def run_task(
     else:
         print(f"\n [System] 正在尝试恢复任务...")
 
-    report_progress(5, "初始化", "正在准备任务环境...")
+    report_progress("prepare", 5, "正在准备任务环境...")
 
     category_label = (
         f"【{category}】" if category and category != "综合" else "【综合】"
@@ -59,7 +63,7 @@ def run_task(
 
     # --- 2. 注入记忆 & 编译图 ---
     # 使用上下文管理器打开 SQLite 连接
-    report_progress(10, "初始化", "正在连接数据库...")
+    report_progress("prepare", 15, "正在连接数据库...")
     with checkpointer_manager.get_checkpointer() as checkpointer:
 
         #  关键：在这里把 workflow 编译成可运行的 app，并挂载记忆
@@ -103,10 +107,12 @@ def run_task(
             "end_date": end_date,
             "forecast_range": forecast_range,  # 预测时间范围
             "category": category,  # 类别筛选
+            "force_audit_update": force_audit_update,
             # 初始化所有字段，防止首次运行报错
             "messages": [],
             "raw_trends": [],
             "core_events": [],
+            "focus_events": [],
             "pending_posts": [],
             "analyzed_events": [],
             "audit_results": [],
@@ -124,36 +130,23 @@ def run_task(
         # 配置信息 (告诉 LangGraph 当前是哪个线程)
         config = {"configurable": {"thread_id": thread_id}}
 
-        # 节点名称到进度的映射 (与 workflow.py 14 节点一一对应)
+        # 节点名称到阶段进度的映射
         node_progress_map = {
-            "node_classify": (15, "数据分类", "Agent 正在对热搜进行分类..."),
-            "agent_a": (25, "数据准备", "Agent A 正在执行 ETL + 选题 + 数据拓展..."),
-            "agent_b_analyze": (40, "观点分析", "Agent B 正在进行深度舆情分析..."),
-            "agent_c": (50, "合规审查", "Agent C 正在进行合规性审查..."),
-            "quality_gate_bc": (58, "质量评估", "LLM 正在评估 B+C 输出质量..."),
-            "agent_d": (70, "趋势预测", "Agent D 正在预测舆情趋势..."),
-            # "agent_historical": (72, "历史回顾", ...),  # 暂不启用
-            "quality_gate_d": (80, "质量评估", "LLM 正在评估 D 输出质量..."),
-            "agent_e": (90, "报告生成", "Agent E 正在生成研判报告..."),
+            "node_classify": ("prepare", 20, "正在进行分类整理..."),
+            "agent_a": ("prepare", 100, "正在准备事件与证据数据..."),
+            "agent_b_analyze": ("deep_read", 100, "正在完成重点舆情深读..."),
+            "agent_c": ("compliance", 100, "正在完成违规审核..."),
+            "agent_d": ("forecast", 100, "正在完成趋势预测..."),
+            "agent_e": ("report", 90, "正在生成与导出报告..."),
         }
 
         # --- 4. 启动流式运行 ---
-        report_progress(12, "数据分类", "正在启动工作流...")
+        report_progress("prepare", 10, "正在启动工作流...")
         try:
             # app.stream 会一步步执行节点
             # stream_mode="updates" 表示只返回状态更新的部分
             step_count = 0
-            completed_nodes = set()  # 跟踪已完成的节点
-
-            # 并行节点组：同组全部完成后才预告下一阶段
-            _parallel_groups = {
-                "agent_b_analyze": "bc_group",
-                "agent_c": "bc_group",
-                # agent_d 不再与 historical 并行，无需分组
-            }
-            _group_next_hint = {
-                "bc_group": (57, "质量评估", "LLM 正在评估 B+C 输出质量..."),
-            }
+            completed_nodes = set()
 
             for output in app.stream(initial_state, config=config):
                 step_count += 1
@@ -166,49 +159,19 @@ def run_task(
 
                     # 报告进度
                     if node_name in node_progress_map:
-                        prog, step, msg = node_progress_map[node_name]
-                        report_progress(prog, step, f"{step}完成")
-
-                        group = _parallel_groups.get(node_name)
-                        if group:
-                            # 并行节点：等同组全部完成后才预告下一阶段
-                            siblings = [
-                                n for n, g in _parallel_groups.items() if g == group
-                            ]
-                            if all(s in completed_nodes for s in siblings):
-                                np, ns, _ = _group_next_hint[group]
-                                report_progress(np, ns, f"{ns}处理中...")
-                            # 否则不预告，避免误导
-                        else:
-                            # 非并行节点：直接预告下一步
-                            try:
-                                node_keys = list(node_progress_map.keys())
-                                idx = node_keys.index(node_name)
-                                if idx + 1 < len(node_keys):
-                                    next_name = node_keys[idx + 1]
-                                    next_prog, next_step, _ = node_progress_map[
-                                        next_name
-                                    ]
-                                    processing_prog = min(next_prog - 1, prog + 1)
-                                    report_progress(
-                                        processing_prog,
-                                        next_step,
-                                        f"{next_step}处理中...",
-                                    )
-                            except Exception:
-                                pass
+                        stage_id, stage_progress, msg = node_progress_map[node_name]
+                        report_progress(stage_id, stage_progress, msg)
                     else:
-                        current_step = state_delta.get("current_step", "处理中")
                         report_progress(
-                            min(15 + step_count * 10, 95),
-                            current_step,
+                            "prepare",
+                            min(90, 10 + step_count * 5),
                             f"节点 {node_name} 处理完成",
                         )
 
             # --- 5. 任务结束 ---
             print("-" * 50)
             print(f" 全流程执行完毕！ ")
-            report_progress(98, "完成", "正在保存最终结果...")
+            report_progress("report", 100, "正在保存最终结果...")
 
             # 获取最终状态以打印 PDF 路径
             final_snapshot = app.get_state(config)
@@ -221,7 +184,7 @@ def run_task(
                 print(f"📂 请前往项目 output/ 目录查看最新生成的 PDF 报告。")
 
             print(f" 提示：保留 ID '{thread_id}'，下次运行时传入可回溯历史。")
-            report_progress(100, "完成", "报告生成成功！")
+            report_progress("done", 100, "报告生成成功！")
 
         except KeyboardInterrupt:
             print("\n\n🛑 [System] 用户手动中止任务。")

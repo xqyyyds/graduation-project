@@ -96,6 +96,14 @@ class PostOpinionSummary(BaseModel):
     conflict_analysis: str = Field(
         description="分析评论区的舆论对立程度。若存在激烈争论或群体冲突，请指出核心矛盾点；若氛围和谐，填'无'。"
     )
+    trigger_summary: str = Field(
+        default="",
+        description="该帖在本期舆情中的触发点：什么内容最容易点燃讨论、引发转发或集中跟评。",
+    )
+    propagation_hint: str = Field(
+        default="",
+        description="该帖评论区主要把议题往哪个方向推进（如从价格焦虑滑向质量质疑或维权成本讨论）。",
+    )
 
 
 # =====================================================
@@ -108,19 +116,32 @@ class EventAnalysisReport(BaseModel):
     Reduce阶段产物：事件深度报告
     """
 
+    editorial_title: str = Field(
+        default="",
+        description="更有传播力和成品感的深读标题，不是简单复述热搜词。标题可以有钩子，但不能低俗、夸张或标题党式空喊。",
+    )
+    one_line_verdict: str = Field(
+        default="",
+        description="一句话判断该事件的本质矛盾或舆情主轴。必须先下判断，再展开，不得写成空泛导语。",
+    )
+
     # 1. 事实层
     event_overview: str = Field(
-        description="【事件概述】必须不少于150字/8句话。以新闻调查记者的笔触，高密度还原核心事实，必须包含：关键时间节点、冲突爆发点、官方处置动作、媒体定性引用。若时间不确定必须写'时间待核实'，严禁编造年份日期。【重要：严禁使用任何Emoji表情符号，保持严肃专业的报告风格】"
+        description="【事件概述】输出为1-2段连贯文字，按“触发点 -> 放大过程 -> 争议外溢 -> 周期末状态”的顺序还原事件推进。必须以官方事实与时间推进线为主干，评论区内容仅可补充公众反应，不得替代事实进展。若输入含明确时间点（如3月24日/3月25日），应自然写入叙事；若时间线混乱、冲突或缺失，需改按“事件主矛盾 -> 争议升级 -> 当前悬而未决点”自组织成合理段落，不得硬凑伪时间线。必须写成自然叙事，不要使用“事件概况：”开头，不要写成“研判周期：”“核心事实：”“关键节点与处置：”“讨论点包括：”等标签化模板句。若时间不确定必须写'时间待核实/未见权威通报'，严禁编造年份日期。"
     )
 
     # 2. 观点层
     public_opinions: List[str] = Field(
-        description="【舆论观点】必须至少4项，每项不少于50字/2句话。分层级梳理：1.主流声浪（占优势的网民态度）2.次生质疑（对处置过程的延伸批判）3.深层情绪（隐藏的群体心理）4.对立博弈（正反双方逻辑交锋）。必须基于舆情切片中的观点分布/评论摘录进行概括，不得捏造。【重要：严禁使用任何Emoji表情符号，使用规范的书面语】"
+        description="【舆论观点画像】固定输出4条，按顺序对应：主流声浪、次生质疑、深层情绪、对立博弈。四条必须分别以“主流声浪：”“次生质疑：”“深层情绪：”“对立博弈：”开头。每条都要体现谁在这样想、为什么这样想、这种声音会把讨论推向哪里；若对立博弈不显著，第4条需明确写出“对立博弈不显著”。"
     )
 
     # 3. 深度层（深度点评，禁止复述事件概述）
     depth_analysis: str = Field(
-        description="【舆情分析-深度点评】必须不少于200字/3个自然段。🚨严禁复述事件概述中的内容，严禁描述事件经过/时间线。必须是独立观点输出：(1)对事件本质的判断(2)社会意义与警示价值(3)对涉事各方的评价与反思(4)社会学归因分析。风格要像社论评论，而非新闻报道。【重要：严禁使用任何Emoji表情符号，保持深度与严肃性】"
+        description="【深度研判】写成2段连贯文字。第一段回答本期被引爆的关键机制，第二段回答其折射出的更大治理/信任/传播结构问题。严禁复述事件概述，不能写成模板评论或要点清单；不得重复具体时间点、传播顺序、截图链条或回应顺序等事实性叙述。"
+    )
+    key_quotes: List[str] = Field(
+        default_factory=list,
+        description="最能代表舆论气氛的关键引述，2-5条即可。要保留现场感，避免无信息量的短句。",
     )
 
 
@@ -186,6 +207,80 @@ class BatchComplianceResult(BaseModel):
     )
 
 
+class ViolationCaseStage1(BaseModel):
+    """第一阶段审核判定结果（仅模型判定字段）"""
+
+    index: int = Field(..., description="主贴为 -1，评论为对应序号。")
+    quote: str = Field(..., description="用于判定的关键摘录。")
+    category: str = Field(
+        ...,
+        description="第一阶段判定类别；必须来自白名单。必须先做语境与对象识别：若仅为公共事件讨论、对涉事方/品牌/平台/机构/带货者/公众人物的追责批评、消费吐槽、短句情绪表达或对象不明表达，应输出空字符串。",
+    )
+    reasoning: str = Field(
+        ...,
+        description="第一阶段判定依据。需按“语境→对象→行为强度→处罚阈值”说明结论；不得把负面评价、愤怒语气、道德谴责或平台质疑直接等同于造谣/网暴。若判定不违规，应优先采用固定执法结论句式并说明未达到社区处罚阈值。",
+    )
+    is_violation: bool = Field(
+        ...,
+        description="是否判定为违规。仅当存在明确对象、明确越线行为且达到社区处罚阈值，并有可定位证据时为 true；证据不足、对象不明、短句情绪化表达或仅属公共讨论批评时应为 false。",
+    )
+
+
+class ViolationCaseStage1Batch(BaseModel):
+    """第一阶段审核判定批次"""
+
+    cases: List[ViolationCaseStage1] = Field(
+        default_factory=list, description="本批第一阶段审核结果。"
+    )
+
+
+class ViolationCase(BaseModel):
+    """第二阶段增强后的最终违规结果"""
+
+    source_type: Literal["post", "comment"] = Field(
+        ..., description="违规来源类型：主贴或评论。"
+    )
+    source_id: str = Field(..., description="主贴 note_id 或评论 comment_id。")
+    index: int = Field(..., description="主贴为 -1，评论为对应序号。")
+    quote: str = Field(..., description="用于展示的违规摘录。")
+    category: str = Field(..., description="最终违规类别。")
+    risk_level: Literal["High", "Medium", "Low"] = Field(..., description="风险等级。")
+    reasoning: str = Field(..., description="逐条判定理由。")
+    disposal_suggestion: str = Field(
+        ...,
+        description=(
+            "逐条处置建议（六选一）："
+            "限制/更改/屏蔽/删除相关内容的展示；"
+            "撤销/删除/禁止修改账号认证、个人信息；"
+            "禁言、禁点赞、禁被关注、禁发送及接收私信；"
+            "扣除信用积分、中止或扣除广告共享收益、暂停/终止服务、注销账号；"
+            "向有关监管部门或国家机关报告；"
+            "其他合理措施。"
+        ),
+    )
+    is_violation: bool = Field(..., description="是否最终认定违规。")
+    primary_law: Optional[str] = Field(
+        default="",
+        description="后处理挂接的主要依据条款文本；由法规检索补充，不强制模型生成。",
+    )
+    law_reason: Optional[str] = Field(
+        default="",
+        description="后处理生成的法规匹配说明；用于报告附录和展示层解释。",
+    )
+    evidence_chain: List[str] = Field(
+        default_factory=list,
+        description="后处理拼装的证据链要点，通常包含违规摘录、判定要点、主要依据与匹配说明。",
+    )
+
+
+class ViolationCaseBatch(BaseModel):
+    """第二阶段增强后的最终结果批次"""
+
+    cases: List[ViolationCase] = Field(
+        default_factory=list, description="本批终裁结果。"
+    )
+
+
 # =====================================================
 # 4.1 Agent C: 合规审查 (Batch + RAG 证据链)
 # =====================================================
@@ -231,9 +326,43 @@ class ForecastPoint(BaseModel):
         ...,
         description="子标题，高度概括该风险点。格式如：'（一）跨区域执法标准不一易引发舆论争议'。严禁使用Emoji。",
     )
+    audience: str = Field(
+        default="",
+        description="最容易被卷入这一风险的人群、机构或平台角色。",
+    )
+    scene: str = Field(
+        default="",
+        description="一个具体、可感知的生活场景或舆论现场，用来说明这类风险最可能从哪里被点燃。",
+    )
+    evolution_path: str = Field(
+        default="",
+        description="从初始触发到舆情放大的演化路径。要写清先因为什么起、再滑向什么争议、最后可能升级到什么公共议题。",
+    )
+
+    # 兼容旧数据字段：新链路不再要求模型主动输出
+    trigger: str = Field(
+        default="",
+        description="【兼容字段】旧版触发节点。新链路优先使用 scene。",
+    )
+    spread_path: str = Field(
+        default="",
+        description="【兼容字段】旧版传播路径。新链路优先使用 evolution_path。",
+    )
+    offline_scene: str = Field(
+        default="",
+        description="【兼容字段】旧版线下场景。新链路优先合并至 scene。",
+    )
+    online_scene: str = Field(
+        default="",
+        description="【兼容字段】旧版线上场景。新链路优先合并至 scene。",
+    )
     content: str = Field(
         ...,
-        description="深度研判内容(不少于200字)，必须包含三个要素：1.触发场景（未来什么具体事件或时间节点会触发此风险）；2.演化路径（舆情将如何从点扩散到面）；3.落地建议（具体的防范或应对措施）。禁止空泛的废话。",
+        description="内部推演底稿。说明风险为何在目标周期内容易出现、谁会推动扩散、哪类节点最危险。禁止空泛套话。",
+    )
+    summary_paragraph: str = Field(
+        default="",
+        description="面向读者展示的成品段落（建议140-240字）。首句必须从具体、可传播的起火场景切入，禁止以“当前/未来/这一风险/值得关注”等抽象判断开头；中段要自然写清争议如何被推大，不能机械履约或逐项翻译字段；结尾必须明确落到更大的公共议题（如规则公平、责任分配、平台治理、机构公信力、群体对立、消费信任等），不得只用“值得警惕/需重视”收尾。",
     )
     likelihood: Literal["高", "中", "低"] = Field(
         ..., description="该风险在预测周期内发生的概率评估。"
@@ -249,15 +378,31 @@ class ForecastTopic(BaseModel):
 
     topic_name: str = Field(
         ...,
-        description="议题标题，采用动宾结构或对仗句式，风格严肃。如：'如何打好...攻坚战' 或 '警惕...风险叠加'。",
+        description="议题标题，要有判断和记忆点，能概括这一组风险的主轴，不要写成行政口号。",
     )
     background: str = Field(
         ...,
-        description="【未来视角背景】(不少于60字)简述下个周期（研判目标月）的特殊性（如：适逢开学季/政策窗口期/敏感纪念日/特定季节特征）。说明为何在该时间节点此议题会爆发。",
+        description="【未来视角背景】说明为何在这个预测周期内，该议题值得优先关注。要交代时间节点、现实压力或社会节奏，而不是空泛背景。",
+    )
+    main_tension: str = Field(
+        default="",
+        description="该议题最核心的矛盾，必须一句话说透，不要泛泛而谈。",
+    )
+
+    # 兼容旧数据字段：新链路已下沉到 point 级
+    audience: str = Field(
+        default="",
+        description="【兼容字段】旧版 topic 级涉及人群。新链路优先使用 point.audience。",
+    )
+    scene_opening: str = Field(
+        default="",
+        description="【兼容字段】旧版 topic 级场景。新链路优先使用 point.scene。",
     )
     points: List[ForecastPoint] = Field(
         ...,
-        description="该议题下的具体风险演化点（必须3-5个）。",
+        min_length=2,
+        max_length=4,
+        description="该议题下的具体风险演化点。要求角度彼此区分，避免重复改写同一个风险。",
     )
 
 
@@ -268,11 +413,13 @@ class TrendForecastReport(BaseModel):
 
     evidence_sources: List[str] = Field(
         ...,
-        description="【参考文献/宏观依据】列出推演时参考的宏观依据来源，如：'教育部历年工作要点'、'国家统计局季节性数据'、'XX行业发展规划'等。",
+        description="【参考依据】列出推演时参考的关键来源类别，建议 3-8 条，不要长串堆砌。",
     )
 
     topics: List[ForecastTopic] = Field(
         ...,
+        min_length=3,
+        max_length=5,
         description="【核心议题预测】列出 3-5 个(必须3-5个)下个月最需要关注的舆情风险议题。要求各议题维度互不重复（正交）。",
     )
 
@@ -289,29 +436,9 @@ class PrefaceSection(BaseModel):
         ..., description="报告覆盖及研判周期 (如: '2025年10月回顾及11月前瞻')"
     )
 
-    overview: str = Field(
+    paragraphs: List[str] = Field(
         ...,
-        description="【开篇综述】必须不少于200字/2个自然段。概括本周期舆情的时间跨度、涉及领域（如社会/高校/生活/综合等提示词传递的领域）、总体态势，并提炼热点领域分布与主导情绪结构。严禁空泛套话，必须结合素材中的具体事件类型进行归纳。风格严肃，严禁使用Emoji。",
-    )
-
-    characteristics: List[str] = Field(
-        ...,
-        description="【特征分析】提炼3个核心特征（其一、其二、其三）。每个特征必须不少于80字/5句话，必须同时包含：(1)现象层：从素材中抽象出的共性规律；(2)机制层：用社会学/传播学概念解释成因；(3)影响层：该特征如何影响公众情绪或治理成本。禁止写成固定的'敏感性/碎片化/传播速度'三件套。风格严肃，严禁使用Emoji。",
-    )
-
-    compliance_perspective: str = Field(
-        ...,
-        description="【违规透视】必须不少于100字/6句话。基于合规数据分析舆论场的非理性程度，必须给出2-3条典型风险形态的概括性例子（可基于素材转述），指明主要违规类型集中在哪些领域。风格严肃，严禁使用Emoji。",
-    )
-
-    trend_connection: str = Field(
-        ...,
-        description="【时空承接】必须不少于80字/5句话。结合趋势预测指出下阶段可能与特定议题产生共振的风险点，必须包含引导语'未来风险的详细推演，请见报告正文'。风格严肃，严禁使用Emoji。",
-    )
-
-    conclusion: str = Field(
-        ...,
-        description="【结语】必须不少于100字/6句话。总结当下核心风险（如脆弱性、情绪驱动性），并给出至少3条可落地的宏观治理建议（如前置预警、澄清机制、平台治理、舆情监测系统完善等）。风格严肃，严禁使用Emoji。",
+        description="【主输出】前言成品正文，严格输出1-2段。必须像压缩型新闻综述前言，而不是报告导读、正文摘要或提纲拼接。第一段先拎出本期主轴，再自然带出议题分布与总体情绪；第二段只压缩风险压力、治理难点与未来关注方向，不得展开成正文分析。",
     )
 
 
@@ -376,25 +503,23 @@ class EventDuplicateCheck(BaseModel):
 
 
 class QualityScore(BaseModel):
-    """Supervisor 对 Agent 输出的质量评估"""
+    """兼容旧字段的质量检查记录（已不再作为主门控评分模型）"""
 
-    agent_name: str = Field(
-        ..., description="被评估的 Agent 名称(如：agent_b, agent_c, agent_d)"
-    )
+    agent_name: str = Field(..., description="对应的节点名称，用于兼容旧状态结构")
     completeness: int = Field(
-        ..., ge=0, le=10, description="完整性得分(0-10)：是否覆盖所有必要维度"
+        ..., ge=0, le=10, description="兼容旧字段：不再作为主门控评分依据"
     )
     accuracy: int = Field(
-        ..., ge=0, le=10, description="准确性得分(0-10)：数据引用是否准确"
+        ..., ge=0, le=10, description="兼容旧字段：不再作为主门控评分依据"
     )
     depth: int = Field(
-        ..., ge=0, le=10, description="深度得分(0-10)：分析是否有独立见解而非复述"
+        ..., ge=0, le=10, description="兼容旧字段：不再作为主门控评分依据"
     )
     overall: int = Field(
-        ..., ge=0, le=10, description="综合评分(0-10)：加权平均或管理员判断"
+        ..., ge=0, le=10, description="兼容旧字段：不再作为主门控评分依据"
     )
-    passed: bool = Field(..., description="是否通过质量门控(overall>=7为通过)")
-    feedback: str = Field(..., description="质量反馈：通过则为空，不通过则给出改进建议")
+    passed: bool = Field(..., description="兼容旧字段：是否通过检查")
+    feedback: str = Field(..., description="兼容旧字段：检查反馈信息")
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="可选的额外元数据(如: check_type, rule_violations, llm_rationale)",

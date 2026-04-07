@@ -2,8 +2,8 @@
   <div class="reports-container">
     <div class="page-header">
       <div class="header-content">
-        <h1 class="page-title">历史研判档案</h1>
-        <p class="page-desc">Archived Intelligence Reports</p>
+        <h1 class="page-title">报告产物中心</h1>
+        <p class="page-desc">统一汇总结构化报告、HTML 成品、PDF 成品与 Markdown 归档</p>
       </div>
       <div class="header-actions">
         <el-input
@@ -67,7 +67,8 @@
 
         <div class="card-body">
           <div class="card-top">
-            <div class="file-type-icon">MD</div>
+            <div class="file-type-icon">REPORT</div>
+            <div class="report-mode-tag">结构化成品</div>
             <el-tag
               :type="getCategoryType(report.category)"
               size="small"
@@ -91,6 +92,17 @@
             </div>
           </div>
 
+          <div class="artifact-row">
+            <span
+              v-for="artifact in getArtifactBadges(report.filename)"
+              :key="artifact.key"
+              class="artifact-chip"
+              :class="{ active: artifact.available }"
+            >
+              {{ artifact.label }}
+            </span>
+          </div>
+
           <div class="card-actions">
             <el-button
               type="primary"
@@ -99,18 +111,21 @@
               bg
               @click.stop="viewReport(report.filename)"
             >
-              阅读
+              查看成品
             </el-button>
             <div class="action-right">
-              <el-tooltip content="下载 Markdown" placement="top">
-                <el-button
-                  size="small"
-                  circle
-                  @click.stop="downloadReport(report.filename)"
-                >
+              <el-dropdown @command="(format) => downloadReport(report.filename, format)">
+                <el-button size="small" circle @click.stop>
                   <el-icon><Download /></el-icon>
                 </el-button>
-              </el-tooltip>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="md">下载 Markdown</el-dropdown-item>
+                    <el-dropdown-item command="html">下载 HTML</el-dropdown-item>
+                    <el-dropdown-item command="pdf">下载 PDF</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
               <el-tooltip content="删除档案" placement="top">
                 <el-button
                   type="danger"
@@ -129,7 +144,7 @@
     </transition-group>
 
     <div v-if="!filteredReports.length" class="empty-wrapper">
-      <el-empty description="暂无相关档案" :image-size="200" />
+      <el-empty description="暂无相关报告产物" :image-size="200" />
     </div>
 
     <div class="pagination-container" v-if="filteredReports.length > pageSize">
@@ -146,8 +161,8 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from "vue";
-import { useRouter } from "vue-router";
+import { ref, computed, onMounted, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { useAppStore } from "../stores/app";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Refresh, Search, ArrowDown } from "@element-plus/icons-vue";
@@ -155,6 +170,7 @@ import api from "../api";
 import dayjs from "dayjs";
 
 const router = useRouter();
+const route = useRoute();
 const store = useAppStore();
 
 const selectedCategory = ref("全部");
@@ -162,6 +178,7 @@ const searchKeyword = ref("");
 const currentPage = ref(1);
 const pageSize = ref(20);
 const sortOrder = ref("newest");
+const artifactMap = ref({});
 
 const categories = computed(() => store.categories);
 const reports = computed(() => store.reports);
@@ -186,6 +203,16 @@ const paginatedReports = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value;
   return filteredReports.value.slice(start, start + pageSize.value);
 });
+
+const getArtifactBadges = (filename) => {
+  const source = artifactMap.value[filename] || {};
+  return [
+    { key: "json", label: "JSON", available: Boolean(source.json) },
+    { key: "html", label: "HTML", available: Boolean(source.html) },
+    { key: "pdf", label: "PDF", available: Boolean(source.pdf) },
+    { key: "markdown", label: "MD", available: Boolean(source.markdown) },
+  ];
+};
 
 // 样式映射
 const getCategoryType = (cat) => {
@@ -222,6 +249,7 @@ const formatSize = (bytes) =>
 const handleCategoryChange = (cat) => {
   selectedCategory.value = cat;
   currentPage.value = 1;
+  syncQuery();
 };
 const handleSortChange = (cmd) => {
   sortOrder.value = cmd;
@@ -229,24 +257,55 @@ const handleSortChange = (cmd) => {
 };
 const handleSearch = () => {
   currentPage.value = 1;
+  syncQuery();
 };
 const refreshReports = () => store.fetchReports();
 const scrollToTop = () => window.scrollTo({ top: 0, behavior: "smooth" });
 
+const syncQuery = () => {
+  const nextQuery = {};
+  if (selectedCategory.value && selectedCategory.value !== "全部") {
+    nextQuery.category = selectedCategory.value;
+  }
+  if (searchKeyword.value?.trim()) {
+    nextQuery.q = searchKeyword.value.trim();
+  }
+  router.replace({ name: "Reports", query: nextQuery });
+};
+
+const loadVisibleArtifacts = async (list) => {
+  const targets = list.filter((item) => !artifactMap.value[item.filename]);
+  if (!targets.length) return;
+
+  const results = await Promise.allSettled(
+    targets.map((item) => api.getReportArtifacts(item.filename))
+  );
+
+  const nextMap = { ...artifactMap.value };
+  results.forEach((result, index) => {
+    const filename = targets[index].filename;
+    nextMap[filename] =
+      result.status === "fulfilled"
+        ? result.value
+        : { markdown: true, json: false, html: false, pdf: false };
+  });
+  artifactMap.value = nextMap;
+};
+
 const viewReport = (filename) =>
   router.push({ name: "ReportDetail", params: { filename } });
-const downloadReport = (filename) =>
-  window.open(api.downloadReport(filename), "_blank");
+const downloadReport = (filename, format = "md") =>
+  window.open(api.downloadReport(filename, format), "_blank");
 
 const confirmDelete = (report) => {
-  ElMessageBox.confirm(`确认永久删除档案 "${report.title}" ?`, "警告", {
+  ElMessageBox.confirm(`确认永久删除报告 "${report.title}" ?`, "警告", {
     confirmButtonText: "删除",
     cancelButtonText: "取消",
     type: "warning",
   }).then(async () => {
     try {
       await api.deleteReport(report.filename);
-      ElMessage.success("档案已销毁");
+      ElMessage.success("报告产物已删除");
       refreshReports();
     } catch (e) {
       ElMessage.error("删除失败");
@@ -254,7 +313,23 @@ const confirmDelete = (report) => {
   });
 };
 
-onMounted(() => store.fetchReports());
+watch(
+  () => paginatedReports.value,
+  (list) => {
+    loadVisibleArtifacts(list);
+  },
+  { immediate: true }
+);
+
+onMounted(() => {
+  if (route.query.category && typeof route.query.category === "string") {
+    selectedCategory.value = route.query.category;
+  }
+  if (route.query.q && typeof route.query.q === "string") {
+    searchKeyword.value = route.query.q;
+  }
+  refreshReports();
+});
 </script>
 
 <style scoped>
@@ -280,8 +355,7 @@ onMounted(() => store.fetchReports());
   color: var(--text-muted);
   font-size: 13px;
   margin-top: 4px;
-  font-family: "Inter", sans-serif;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.02em;
 }
 
 .header-actions {
@@ -395,12 +469,14 @@ onMounted(() => store.fetchReports());
 }
 .card-top {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
   margin-bottom: 16px;
 }
 
 .file-type-icon {
-  width: 32px;
+  min-width: 64px;
   height: 32px;
   background: var(--el-fill-color-blank, #f1f5f9);
   color: var(--text-secondary);
@@ -411,6 +487,17 @@ onMounted(() => store.fetchReports());
   font-size: 10px;
   font-weight: 800;
   border: 1px solid var(--border-color);
+  letter-spacing: 0.08em;
+}
+
+.report-mode-tag {
+  margin-left: auto;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--primary-color);
+  background: rgba(59, 130, 246, 0.08);
 }
 
 .report-title {
@@ -431,7 +518,7 @@ onMounted(() => store.fetchReports());
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 .meta-row {
   display: flex;
@@ -448,6 +535,32 @@ onMounted(() => store.fetchReports());
   align-items: center;
   border-top: 1px solid var(--border-color);
   padding-top: 16px;
+}
+
+.artifact-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.artifact-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-color);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.artifact-chip.active {
+  color: var(--primary-color);
+  border-style: solid;
+  border-color: rgba(59, 130, 246, 0.18);
+  background: rgba(59, 130, 246, 0.08);
 }
 .action-right {
   display: flex;
@@ -473,5 +586,25 @@ onMounted(() => store.fetchReports());
   display: flex;
   justify-content: center;
   margin-top: 40px;
+}
+
+@media (max-width: 900px) {
+  .page-header,
+  .category-tabs {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .header-actions,
+  .search-input {
+    width: 100%;
+  }
+
+  .sort-control {
+    margin-left: 0;
+    justify-content: space-between;
+    width: 100%;
+    padding-top: 8px;
+  }
 }
 </style>

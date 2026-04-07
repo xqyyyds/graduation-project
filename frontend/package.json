@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node src/api/index.test.mjs && node src/views/reportPresentation.test.mjs && node src/views/taskProgress.test.mjs && node src/views/markdownSanitizer.test.mjs"
   },
   "dependencies": {
     "@ctrl/tinycolor": "^4.2.0",

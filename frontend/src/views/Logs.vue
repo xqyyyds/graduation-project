@@ -54,7 +54,7 @@
         <span>UTF-8</span>
       </div>
       <div class="sb-section">
-        <span>Port: 8000</span>
+        <span>{{ connectionUrl }}</span>
       </div>
     </div>
   </div>
@@ -62,6 +62,7 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
+import { getWsUrl, SETTINGS_UPDATED_EVENT } from "../api";
 import { Delete, Monitor, Promotion, Warning, CircleClose, List } from '@element-plus/icons-vue';
 
 // 核心数据
@@ -69,22 +70,22 @@ const logs = ref([]);
 const connected = ref(false);
 const autoScroll = ref(true);
 const terminalRef = ref(null);
+const connectionUrl = ref(getWsUrl());
 
 // WebSocket 变量
 let ws = null;
 let reconnectTimer = null;
 let heartbeatTimer = null;
+let manualReconnect = false;
 
 // 1. 真实的 WebSocket 连接逻辑
 const connectWebSocket = () => {
   if (ws && ws.readyState === WebSocket.OPEN) return;
-
-  // ⚠️ 连接到你的真实后端地址
-  ws = new WebSocket("ws://localhost:8000/ws/logs");
+  connectionUrl.value = getWsUrl();
+  ws = new WebSocket(connectionUrl.value);
 
   ws.onopen = () => {
     connected.value = true;
-    console.log("System Terminal: Connection Established.");
     startHeartbeat();
   };
 
@@ -113,16 +114,40 @@ const connectWebSocket = () => {
 
   ws.onclose = () => {
     connected.value = false;
+    const shouldReconnect = !manualReconnect;
+    manualReconnect = false;
     console.warn("System Terminal: Connection Lost. Retrying in 5s...");
     stopHeartbeat();
     // 断线重连机制
-    reconnectTimer = setTimeout(connectWebSocket, 5000);
+    if (shouldReconnect) {
+      reconnectTimer = setTimeout(connectWebSocket, 5000);
+    }
   };
 
   ws.onerror = (error) => {
     console.error("WebSocket Error:", error);
     connected.value = false;
   };
+};
+
+const resetConnection = () => {
+  connectionUrl.value = getWsUrl();
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  manualReconnect = true;
+  stopHeartbeat();
+  if (ws) {
+    try {
+      ws.close();
+    } catch {
+      // ignore
+    }
+    ws = null;
+  }
+  connected.value = false;
+  connectWebSocket();
 };
 
 // 2. 心跳保活 (防止长时间无日志自动断开)
@@ -174,13 +199,25 @@ watch(autoScroll, (val) => {
   if (val) nextTick(scrollToBottom);
 });
 
+const handleSettingsUpdated = () => {
+  const nextUrl = getWsUrl();
+  if (nextUrl !== connectionUrl.value) {
+    resetConnection();
+  }
+};
+
 // 生命周期管理
 onMounted(() => {
   connectWebSocket();
   startHeartbeat();
+  window.addEventListener(SETTINGS_UPDATED_EVENT, handleSettingsUpdated);
+  window.addEventListener("storage", handleSettingsUpdated);
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener(SETTINGS_UPDATED_EVENT, handleSettingsUpdated);
+  window.removeEventListener("storage", handleSettingsUpdated);
+  manualReconnect = true;
   if (ws) ws.close();
   if (reconnectTimer) clearTimeout(reconnectTimer);
   stopHeartbeat();
@@ -189,22 +226,53 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .logs-container {
-  display: flex; flex-direction: column; height: calc(100vh - 120px); /* 减去顶部Header高度 */
-  background: #1e1e1e; border-radius: 12px; overflow: hidden;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.2); border: 1px solid #333;
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 120px);
+  background: #1e1e1e;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+  border: 1px solid #333;
 }
 
 /* 工具栏 */
 .logs-toolbar {
-  height: 48px; background: #252526; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px; border-bottom: 1px solid #333;
+  min-height: 56px;
+  background: #252526;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #333;
 }
 .terminal-title {
-  color: #ccc; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; margin: 0; letter-spacing: 0.5px;
+  color: #ccc;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  letter-spacing: 0.5px;
 }
-.toolbar-right { display: flex; align-items: center; gap: 12px; }
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 
-.connection-status { font-size: 12px; color: #666; display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.connection-status {
+  font-size: 12px;
+  color: #666;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
 .connection-status.active { color: #10b981; }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
@@ -244,12 +312,60 @@ onBeforeUnmount(() => {
 
 /* 底部状态栏 */
 .status-bar {
-  height: 24px; background: #007acc; color: #fff; display: flex; align-items: center;
-  font-family: sans-serif; font-size: 11px; padding: 0 8px; cursor: default;
+  min-height: 28px;
+  background: #007acc;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  font-family: sans-serif;
+  font-size: 11px;
+  padding: 0 8px;
+  cursor: default;
 }
 .sb-section { padding: 0 8px; display: flex; align-items: center; gap: 4px; height: 100%; }
 .sb-section:hover { background: rgba(255,255,255,0.1); }
 .sb-section.warning { background: #cca700; }
 .sb-section.error { background: #c90000; }
 .sb-spacer { flex: 1; }
+
+@media (max-width: 900px) {
+  .logs-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .toolbar-right {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .log-row {
+    display: grid;
+    grid-template-columns: 36px 1fr;
+    gap: 2px 10px;
+    padding: 8px 0;
+  }
+
+  .log-gutter {
+    grid-row: span 2;
+    width: auto;
+  }
+
+  .log-time,
+  .log-level,
+  .log-msg {
+    width: auto;
+  }
+
+  .status-bar {
+    row-gap: 4px;
+    padding: 6px 8px;
+  }
+
+  .sb-section:last-child {
+    width: 100%;
+    word-break: break-all;
+  }
+}
 </style>

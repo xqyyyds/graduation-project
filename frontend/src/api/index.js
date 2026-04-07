@@ -1,31 +1,63 @@
 import axios from "axios";
 
+export const SETTINGS_UPDATED_EVENT = "app-settings-updated";
+
 // 1. 创建实例 (不再写死 baseURL，而在拦截器中动态处理)
 const instance = axios.create({
-  timeout: 60000, // 60秒超时
+  timeout: 60000,
 });
 
-// 辅助函数：获取当前配置的 Base URL
-const getBaseUrl = () => {
+export const getStoredSettings = () => {
   try {
-    // 从 localStorage 读取我们在 Settings.vue/Store 中保存的配置
     const settings = localStorage.getItem("appSettings");
     if (settings) {
-      const parsed = JSON.parse(settings);
-      // 如果有配置且不为空，使用配置的地址；去掉末尾可能的斜杠
-      if (parsed.apiUrl) return parsed.apiUrl.replace(/\/$/, "");
+      return JSON.parse(settings);
     }
   } catch (e) {
-    console.warn("读取 API 配置失败，使用默认地址");
+    console.warn("读取应用设置失败，使用默认值");
   }
-  return "http://localhost:8000"; // 默认兜底地址
+  return {
+    apiUrl: "http://localhost:8000",
+    timeout: 60,
+    listDensity: "default",
+  };
+};
+
+export const normalizeBaseUrl = (value) =>
+  (value || "http://localhost:8000").trim().replace(/\/$/, "");
+
+export const getBaseUrl = () => {
+  const { apiUrl } = getStoredSettings();
+  return normalizeBaseUrl(apiUrl);
+};
+
+export const getTimeout = () => {
+  const { timeout } = getStoredSettings();
+  const parsedTimeout = Number(timeout);
+  return Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 60;
+};
+
+export const deriveWsUrl = (baseUrl) =>
+  normalizeBaseUrl(baseUrl).replace(/^http/i, "ws") + "/ws/logs";
+
+export const getWsUrl = () => deriveWsUrl(getBaseUrl());
+
+export const notifySettingsUpdated = (nextSettings = {}) => {
+  window.dispatchEvent(
+    new CustomEvent(SETTINGS_UPDATED_EVENT, {
+      detail: {
+        ...getStoredSettings(),
+        ...nextSettings,
+      },
+    })
+  );
 };
 
 // 2. 请求拦截器：动态注入 Base URL
 instance.interceptors.request.use(
   (config) => {
-    // 每次请求前动态设置 baseURL
     config.baseURL = getBaseUrl();
+    config.timeout = getTimeout() * 1000;
     return config;
   },
   (error) => {
@@ -46,6 +78,17 @@ instance.interceptors.response.use(
 );
 
 export default {
+  async testBackendConnection(payload = {}) {
+    const startedAt = performance.now();
+    const baseUrl = normalizeBaseUrl(payload.url || getBaseUrl());
+    const timeout = Number(payload.timeout || getTimeout()) * 1000;
+    const response = await axios.get(`${baseUrl}/api/health`, { timeout });
+    return {
+      ...response.data,
+      latency: Math.round(performance.now() - startedAt),
+    };
+  },
+
   // --- 仪表盘 ---
   getDashboardStats() {
     return instance.get("/api/dashboard/stats");
@@ -70,10 +113,20 @@ export default {
     return instance.get(`/api/reports/${encodeURIComponent(filename)}`);
   },
 
+  getReportJson(filename) {
+    return instance.get(`/api/reports/${encodeURIComponent(filename)}/json`);
+  },
+
+  getReportArtifacts(filename) {
+    return instance.get(`/api/reports/${encodeURIComponent(filename)}/artifacts`);
+  },
+
   // 修正：下载链接也需要动态拼接 Base URL
-  downloadReport(filename) {
+  downloadReport(filename, format = "md") {
     const baseUrl = getBaseUrl();
-    return `${baseUrl}/api/reports/${encodeURIComponent(filename)}/download`;
+    return `${baseUrl}/api/reports/${encodeURIComponent(
+      filename
+    )}/download?format=${encodeURIComponent(format)}`;
   },
 
   deleteReport(filename) {
@@ -100,5 +153,17 @@ export default {
 
   testLLMConnection(payload = {}) {
     return instance.post("/api/settings/llm/test", payload);
+  },
+
+  getSearchSettings() {
+    return instance.get("/api/settings/search");
+  },
+
+  updateSearchSettings(settings) {
+    return instance.post("/api/settings/search", settings);
+  },
+
+  testSearchConnection(payload = {}) {
+    return instance.post("/api/settings/search/test", payload);
   },
 };

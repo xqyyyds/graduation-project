@@ -1,17 +1,259 @@
 import os
+import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import settings
 from app.core.logger import logger
 from app.core.schemas import PrefaceSection
 from app.core.prompts import AGENT_E_PREFACE_TEMPLATE
+from app.core.llm_factory import get_main_llm
 
 # 工具：归一化违规类别文本，避免细微差异拆桶
 from app.services.utils import normalize_category
+from app.services.report_document import (
+    REPORT_RENDER_VERSION,
+    _compose_forecast_summary_paragraph,
+    build_report_document,
+)
+from app.services.render_html import save_report_html
+from app.services.render_pdf import save_report_pdf
+
+
+def _law_entry_text(law: Any) -> str:
+    if not law:
+        return ""
+    if isinstance(law, str):
+        return law.strip()
+    if isinstance(law, dict):
+        art = law.get("article", "")
+        cat = law.get("category", "")
+        behavior = law.get("full_desc", "")
+        return f"《《微博社区公约》》{art}：{cat}\n{behavior}".strip()
+    return str(law).strip()
+
+
+def _law_entry_bucket(law: Any) -> str:
+    if not law:
+        return "未知条款"
+    if isinstance(law, str):
+        return law.strip() or "未知条款"
+    if isinstance(law, dict):
+        cat = law.get("category") or "未知标签"
+        article = law.get("article") or "未知条款"
+        return f"{cat} / {article}"
+    return str(law).strip() or "未知条款"
+
+
+def render_markdown_from_report_doc(report_doc: Dict[str, Any]) -> str:
+    """从 report_json 派生 Markdown，避免 Markdown 成为第二事实源。"""
+
+    def body(text: Any) -> str:
+        return str(text or "").strip()
+
+    def cell(text: Any) -> str:
+        return body(text).replace("|", r"\|")
+
+    meta = report_doc.get("meta") or {}
+    preface = report_doc.get("preface") or {}
+    compliance = report_doc.get("compliance") or {}
+    compliance_summary = compliance.get("summary") or {}
+    forecast = report_doc.get("forecast") or {}
+    appendix_stats = report_doc.get("appendix_stats") or {}
+
+    lines: List[str] = []
+    lines.append(f"# {body(meta.get('title') or '舆情研判报告')}")
+    lines.append("")
+    lines.append(f"- 类别：{body(meta.get('category') or '综合')}")
+    lines.append(f"- 生成时间：{body(meta.get('generated_at'))}")
+    lines.append(f"- 研判周期：{body(meta.get('report_period'))}")
+    lines.append(
+        f"- 渲染版本：{body(meta.get('render_version') or REPORT_RENDER_VERSION)}"
+    )
+    lines.append("")
+
+    lines.append("## 前言：舆情态势综述")
+    lines.append("")
+    preface_paragraphs = preface.get("paragraphs") or []
+    if preface_paragraphs:
+        for para in preface_paragraphs:
+            lines.append(body(para))
+            lines.append("")
+    else:
+        lines.append("（前言生成异常）")
+        lines.append("")
+
+    lines.append("## 第一部分：本期热点舆情总览")
+    lines.append("")
+    lines.append("| 序号 | 时间 | 事件名称 | 热度值 |")
+    lines.append("| :---: | :---: | :--- | :---: |")
+    for row in report_doc.get("overview_table") or []:
+        lines.append(
+            f"| {row.get('seq', '')} | {body(row.get('time'))} | {cell(row.get('event_name'))} | {body(row.get('heat_value'))} |"
+        )
+    lines.append("")
+
+    lines.append("## 第二部分：重点舆情深读")
+    lines.append("")
+    for idx, item in enumerate(report_doc.get("deep_reads") or [], start=1):
+        lines.append(
+            f"### {idx}. {body(item.get('editorial_title') or item.get('event_name') or '重点舆情')}"
+        )
+        lines.append("")
+        if item.get("one_line_verdict"):
+            lines.append(f"**一句话判断**：{body(item.get('one_line_verdict'))}")
+            lines.append("")
+        if item.get("event_overview"):
+            lines.append("#### 事件概况")
+            lines.append(body(item.get("event_overview")))
+            lines.append("")
+        if item.get("public_opinions"):
+            lines.append("#### 舆论观点画像")
+            for opinion in item.get("public_opinions") or []:
+                lines.append(f"- {body(opinion)}")
+            lines.append("")
+        if item.get("depth_analysis"):
+            lines.append("#### 深度研判")
+            lines.append(body(item.get("depth_analysis")))
+            lines.append("")
+        if item.get("key_quotes"):
+            lines.append("#### 关键引用")
+            for quote in item.get("key_quotes") or []:
+                lines.append(f"> {body(quote)}")
+            lines.append("")
+
+    lines.append("## 第三部分：违规风险透视")
+    lines.append("")
+    total_cases = compliance_summary.get("total_cases", 0)
+    event_count = compliance_summary.get("event_count", 0)
+    lines.append(
+        f"本期共确认违规案例 **{total_cases}** 条，涉及事件 **{event_count}** 个。"
+    )
+    lines.append("")
+    phase_summary = body(compliance_summary.get("phase_summary"))
+    if phase_summary:
+        lines.append("### 本期违规态势总结")
+        lines.append("")
+        lines.append(phase_summary)
+        lines.append("")
+    lines.append("### 风险等级分布")
+    lines.append("")
+    lines.append("| 风险等级 | 次数 |")
+    lines.append("| :---: | :---: |")
+    for item in compliance_summary.get("risk_levels") or []:
+        lines.append(f"| {body(item.get('label'))} | {item.get('count', 0)} |")
+    lines.append("")
+    lines.append("### 主要违规类别")
+    lines.append("")
+    lines.append("| 违规类别 | 次数 |")
+    lines.append("| :--- | :---: |")
+    for item in (compliance_summary.get("categories") or [])[:8]:
+        lines.append(f"| {cell(item.get('label'))} | {item.get('count', 0)} |")
+    lines.append("")
+
+    lines.append("## 第四部分：未来趋势与战略预警")
+    lines.append("")
+    target_period = body(forecast.get("target_period"))
+    if target_period:
+        lines.append(f"**研判周期**：{target_period}")
+        lines.append("")
+    for idx, topic in enumerate(forecast.get("topics") or [], start=1):
+        lines.append(f"### {idx}. {body(topic.get('topic_name') or '重点议题')}")
+        lines.append("")
+        if topic.get("background"):
+            lines.append(body(topic.get("background")))
+            lines.append("")
+        summary_parts = []
+        if topic.get("main_tension"):
+            summary_parts.append(f"核心矛盾：{body(topic.get('main_tension'))}")
+        topic_audience = topic.get("audience")
+        topic_scene = topic.get("scene_opening")
+        points = topic.get("points") or []
+        if not topic_audience:
+            topic_audience = next(
+                (point.get("audience") for point in points if point.get("audience")),
+                "",
+            )
+        if not topic_scene:
+            topic_scene = next(
+                (point.get("scene") for point in points if point.get("scene")),
+                "",
+            )
+        if topic_audience:
+            summary_parts.append(f"涉及人群：{body(topic_audience)}")
+        if topic_scene:
+            summary_parts.append(f"典型场景：{body(topic_scene)}")
+        if summary_parts:
+            lines.append(f"**预警摘要**：{'；'.join(summary_parts)}")
+            lines.append("")
+        for point in points:
+            lines.append(f"#### {body(point.get('subtitle') or '风险点')}")
+            lines.append(body(_compose_forecast_summary_paragraph(point)))
+            lines.append("")
+
+    lines.append("## 附录：违规数据监测")
+    lines.append("")
+    for title, rows, label in [
+        ("风险等级分布", appendix_stats.get("risk_levels") or [], "风险等级"),
+        ("违规类别分布", appendix_stats.get("categories") or [], "违规类别"),
+        ("依据条款分布", appendix_stats.get("laws") or [], "条款"),
+    ]:
+        lines.append(f"### {title}")
+        lines.append("")
+        lines.append(f"| {label} | 次数 |")
+        lines.append("| :--- | :---: |")
+        for item in rows:
+            lines.append(f"| {cell(item.get('label'))} | {item.get('count', 0)} |")
+        lines.append("")
+
+    appendix_cases = report_doc.get("appendix_cases") or []
+    if appendix_cases:
+        lines.append("### 违规案例明细")
+        lines.append("")
+        for event_idx, event in enumerate(appendix_cases, start=1):
+            lines.append(
+                f"#### {event_idx}. {body(event.get('event_name') or '未知事件')}"
+            )
+            lines.append("")
+            for case_idx, case in enumerate(event.get("cases") or [], start=1):
+                lines.append(f"**案例 {case_idx}**")
+                lines.append("")
+                lines.append(f"**来源类型**：{body(case.get('source_type'))}")
+                lines.append("")
+                lines.append(f"**来源ID**：{body(case.get('source_id'))}")
+                lines.append("")
+                lines.append(f"**序号**：{body(case.get('index'))}")
+                lines.append("")
+                lines.append(f"**所属事件**：{body(event.get('event_name'))}")
+                lines.append("")
+                lines.append(f"**违规类别**：{body(case.get('category'))}")
+                lines.append("")
+                lines.append(f"**风险等级**：{body(case.get('risk_level'))}")
+                lines.append("")
+                lines.append(f"**违规摘录**：{body(case.get('quote'))}")
+                lines.append("")
+                lines.append(f"**判定理由**：{body(case.get('reasoning'))}")
+                lines.append("")
+                lines.append(f"**主要依据**：{body(case.get('primary_law'))}")
+                lines.append("")
+                lines.append(f"**证据链**：{body(case.get('evidence_chain'))}")
+                lines.append("")
+                lines.append(f"**处置建议**：{body(case.get('disposal_suggestion'))}")
+                lines.append("")
+                law_reason = body(case.get("law_reason"))
+                if law_reason:
+                    lines.append(f"**法规说明**：{law_reason}")
+                    lines.append("")
+                lines.append("---")
+                lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _assemble_markdown_from_report_doc(report_doc: Dict[str, Any]) -> str:
+    """兼容测试与旧调用口径，统一从 report_json 渲染 Markdown。"""
+    return render_markdown_from_report_doc(report_doc)
 
 
 class AgentReport:
@@ -21,12 +263,7 @@ class AgentReport:
     """
 
     def __init__(self):
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,
-            temperature=0.5,
-        )
+        self.llm = get_main_llm(temperature=0.5)
         # self.preface_parser = JsonOutputParser(pydantic_object=PrefaceSection) (已弃用)
 
     def _compute_stats(
@@ -62,8 +299,10 @@ class AgentReport:
 
         errors = []
         for num in numbers_in_text:
-            # 如果前言中出现了不在预期范围内的大数字（>100），可能是幻觉
-            if num > 100 and num not in expected_numbers:
+            if 1900 <= num <= 2100:
+                continue
+            # 仅校验看起来像“统计数字”的量级，跳过热度值等大数字
+            if 100 < num <= 1000 and num not in expected_numbers:
                 errors.append(f"检测到可疑数字: {num}")
 
         if errors:
@@ -131,33 +370,33 @@ class AgentReport:
                     cat = normalize_category((c or {}).get("category") or "其他")
                     violation_stats[cat] = violation_stats.get(cat, 0) + 1
 
-        # 2. 生成前言 (更高密度的素材摘要：事件榜单 + 少量深读摘要)
+        # 2. 生成前言（压缩素材：只给定调所需摘要，避免模型把前言写成半篇正文）
         top_events_lines = []
-        for i, e in enumerate(core_events):
+        for i, e in enumerate(core_events[:20]):
             name = e.get("event_name") or e.get("topic") or "未知"
             heat = e.get("total_heat", 0)
-            kws = e.get("related_keywords") or e.get("keywords") or []
-            kw_preview = "、".join([str(x) for x in kws[:4]])
-            top_events_lines.append(f"{i+1}. {name}（热度{heat}） 关键词: {kw_preview}")
+            top_events_lines.append(f"{i+1}. {name}（热度{heat}）")
         top_events_str = (
             "\n".join(top_events_lines) if top_events_lines else "（无事件榜单数据）"
         )
 
         deep_read_lines = []
-        for i, e in enumerate(analyzed_events[:8]):
+        for i, e in enumerate(analyzed_events[:3]):
             name = e.get("event_name") or e.get("topic") or "未知"
-            overview = (e.get("opinion_report") or {}).get("event_overview")
-            overview = (overview or "").strip()
-            if overview:
-                deep_read_lines.append(f"- {name}: {overview}")
+            report = e.get("opinion_report") or {}
+            verdict = (
+                report.get("one_line_verdict") or report.get("event_overview") or ""
+            ).strip()
+            if verdict:
+                deep_read_lines.append(f"- {name}: {verdict[:60]}")
         deep_read_str = (
             "\n".join(deep_read_lines) if deep_read_lines else "（无深读摘要）"
         )
 
         events_str = (
             f"【研判周期】{report_period}\n"
-            f"【热点榜单Top15】\n{top_events_str}\n\n"
-            f"【重点深读摘要Top8】\n{deep_read_str}"
+            f"【热点榜单Top20】\n{top_events_str}\n\n"
+            f"【重点深读摘要Top3】\n{deep_read_str}"
         )
 
         # 当 LLM 未标记为违规但 RAG 命中条款（matched_laws）时，也应当纳入报告展示。
@@ -201,20 +440,19 @@ class AgentReport:
             top_cats = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:3]
             cat_str = "、".join([f"{k}({v}条)" for k, v in top_cats])
 
-            audit_str = f"共发现违规内容 {len(violations)} 条。主要集中在：{cat_str}。"
+            audit_str = f"共发现违规内容 {len(violations)} 条，主要集中在：{cat_str}。"
 
             # 摘录典型案例
             if violations:
                 typical = violations[0].get("violation_info", {})
                 reason = typical.get("reasoning") or "涉及敏感内容"
-                audit_str += f" 典型案例涉及：{reason}。"
+                audit_str += f" 典型风险表现为：{reason[:32]}。"
 
         #  适配新版 TrendForecastReport (topics 列表)
         topics = trend_report.get("topics", [])
         if topics:
-            # 提取每个议题的标题作为摘要
-            topic_titles = [t.get("topic_name", "未知议题") for t in topics]
-            trend_str = f"下月重点关注议题：{'; '.join(topic_titles)}。"
+            topic_titles = [t.get("topic_name", "未知议题") for t in topics[:2]]
+            trend_str = f"下阶段重点风险主线：{'；'.join(topic_titles)}。"
         else:
             trend_str = "下月定调: 暂无明确预测数据"
 
@@ -244,34 +482,44 @@ class AgentReport:
             pass
 
         # 校验前言数字一致性（仅日志记录）
-        preface_text = f"{preface.overview or ''} {preface.conclusion or ''}"
+        preface_text = (
+            " ".join(
+                [text for text in (getattr(preface, "paragraphs", None) or []) if text]
+            )
+            or ""
+        )
         is_valid, mismatch_msg = self._validate_preface_numbers(preface_text, stats)
         if not is_valid:
             logger.warning(f"[Agent E] 前言数字校验不一致: {mismatch_msg}")
         else:
             logger.debug("[Agent E] 前言数字校验通过")
 
-        # 3. 组装 Markdown (传入 core_events 用于表格)
+        # 3. 组装结构化报告对象（单一事实源）
         category = state_data.get("category", "综合")
-        historical_events = state_data.get("historical_events")
-        md_content = self._assemble_markdown(
-            preface,
-            core_events,
-            analyzed_events,
-            violations,
-            trend_report,
-            category,
-            historical_events,
+        report_doc = build_report_document(
+            state_data=state_data,
+            preface=preface,
         )
 
-        # 4. 保存 Markdown 文件 (不再生成 PDF，建议用 Typora 等工具打开 .md 导出)
+        # 4. 所有导出格式从 report_json 派生
+        md_content = _assemble_markdown_from_report_doc(report_doc)
+
+        # 5. 保存多格式产物
         md_filename = f"舆情研判_{category}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
         md_path = self._save_markdown(md_content, md_filename)
+        stem_path = os.path.splitext(md_path)[0]
+        json_path = self._save_json(report_doc, f"{stem_path}.json")
+        html_path = self._save_html(report_doc, f"{stem_path}.html")
+        pdf_path = self._save_pdf(report_doc, f"{stem_path}.pdf")
 
         #  返回违规统计数据，供下游写入 Session
         return {
             "markdown": md_content,
             "md_path": md_path,
+            "json_path": json_path,
+            "html_path": html_path,
+            "pdf_path": pdf_path,
+            "report_json": report_doc,
             "violation_stats": violation_stats,
             "total_violated_posts": total_violated_posts,
             "total_violated_comments": total_violated_comments,
@@ -328,11 +576,7 @@ class AgentReport:
             logger.error(f" 前言生成失败: {e}")
             return PrefaceSection(
                 report_period="本期",
-                overview="（生成异常）",
-                characteristics=["（生成异常）"],
-                compliance_perspective="（生成异常）",
-                trend_connection="（生成异常）",
-                conclusion="（生成异常）",
+                paragraphs=["（生成异常）"],
             )
 
     def _assemble_markdown(
@@ -346,8 +590,24 @@ class AgentReport:
         historical_events: Optional[Dict] = None,
     ) -> str:
         """
-        拼装最终报告 (Markdown 格式)
+        Legacy 兼容入口。
+        统一短路到 report_json -> markdown 渲染链，避免再落回旧版双源拼装逻辑。
         """
+        logger.warning(
+            " [Agent E] 调用了 legacy _assemble_markdown 入口，已自动切换到 report_json 单一事实源渲染链。"
+        )
+        report_doc = build_report_document(
+            {
+                "core_events": core_events,
+                "analyzed_events": b_events,
+                "audit_results": c_violations,
+                "trend_forecast": d_trend,
+                "category": category,
+            },
+            preface=p,
+        )
+        return render_markdown_from_report_doc(report_doc)
+
         date_str = datetime.now().strftime("%Y年%m月%d日")
 
         def _normalize_body_text(s: Any) -> str:
@@ -515,29 +775,15 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         md += "---\n\n"
 
         md += "## 前言：舆情态势综述\n\n"
-
-        # (1) 开篇综述
-        md += f"{_normalize_body_text(p.overview)}\n\n"
-
-        # (2) 核心特征 (段落渲染)
-        md += "**总体来看，当下舆情生态呈现以下核心特征：**\n\n"
-        for i, char_text in enumerate(p.characteristics):
-            prefix = ["其一", "其二", "其三", "其四", "其五"]
-            label = prefix[i] if i < len(prefix) else f"特征{i+1}"
-            # 移除可能重复的 "其一，" 前缀
-            clean_text = char_text.replace(f"{label}，", "").replace(f"{label}：", "")
-            #  改为段落式，而非列表
-            md += f"{label}，{clean_text}\n\n"
-        md += "\n"
-
-        # (3) 违规透视
-        md += f"**【违规风险透视】**\n\n{_normalize_body_text(p.compliance_perspective)}\n\n"
-
-        # (4) 时空承接
-        md += f"**【时空趋势承接】**\n\n{_normalize_body_text(p.trend_connection)}\n\n"
-
-        # (5) 结语
-        md += f"**{_normalize_body_text(p.conclusion)}**\n\n"
+        preface_paragraphs = [
+            _normalize_body_text(text) for text in (getattr(p, "paragraphs", []) or [])
+        ]
+        preface_paragraphs = [text for text in preface_paragraphs if text]
+        if preface_paragraphs:
+            for paragraph in preface_paragraphs:
+                md += f"{paragraph}\n\n"
+        else:
+            md += "（前言生成异常）\n\n"
 
         md += "<div style='page-break-after: always;'></div>\n\n"  # 强制分页
 
@@ -675,9 +921,81 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
             pass
 
         # ==============================================================================
-        # 4. 未来趋势与战略预警 (Forecast)
+        # 4. 违规风险透视 (正文)
         # ==============================================================================
-        md += "## 第三部分：未来趋势与战略预警\n\n"
+        md += "## 第三部分：违规风险透视\n\n"
+
+        if not c_violations:
+            md += "本期未检出需要重点处置的违规内容，风险整体可控。\n\n"
+        else:
+            total_cases = 0
+            event_groups: Dict[str, List[Dict[str, Any]]] = {}
+            risk_counts: Dict[str, int] = {}
+            category_counts: Dict[str, int] = {}
+            for item in c_violations:
+                event_name = item.get("event_name") or "未知事件"
+                info = item.get("violation_info") or {}
+                cases = []
+                if info.get("post_case"):
+                    cases.append(info.get("post_case"))
+                cases.extend(info.get("comment_cases") or [])
+                total_cases += len(cases)
+                if cases:
+                    event_groups.setdefault(event_name, []).extend(cases)
+                overall_risk = info.get("overall_risk_level") or "Low"
+                risk_counts[overall_risk] = risk_counts.get(overall_risk, 0) + len(
+                    cases
+                )
+                for case in cases:
+                    cat = normalize_category(case.get("category") or "其他")
+                    category_counts[cat] = category_counts.get(cat, 0) + 1
+
+            md += (
+                f"本期共确认违规案例 <strong>{total_cases}</strong> 条，"
+                f"涉及事件 <strong>{len(event_groups)}</strong> 个。\n\n"
+            )
+            high_cnt = risk_counts.get("High", 0)
+            medium_cnt = risk_counts.get("Medium", 0)
+            low_cnt = risk_counts.get("Low", 0)
+            md += "### 本期违规态势总结\n\n"
+            summary_parts = [f"当前确认违规内容共 {total_cases} 条。"]
+            if high_cnt:
+                summary_parts.append(f"其中高风险案例 {high_cnt} 条，为当前处置重点。")
+            elif medium_cnt:
+                summary_parts.append(f"当前以中风险案例为主，共 {medium_cnt} 条。")
+            elif low_cnt:
+                summary_parts.append(f"当前以低风险案例为主，共 {low_cnt} 条。")
+            if category_counts:
+                top3 = [
+                    name
+                    for name, _ in sorted(
+                        category_counts.items(), key=lambda item: item[1], reverse=True
+                    )[:3]
+                ]
+                summary_parts.append(f"主要集中在：{'、'.join(top3)}。")
+            md += "".join(summary_parts) + "\n\n"
+
+            md += "### 风险等级分布\n\n"
+            md += "| 风险等级 | 次数 |\n| :---: | :---: |\n"
+            for level in ["High", "Medium", "Low"]:
+                if level in risk_counts:
+                    md += f"| {level} | {risk_counts[level]} |\n"
+            md += "\n"
+
+            md += "### 主要违规类别\n\n"
+            md += "| 违规类别 | 次数 |\n| :--- | :---: |\n"
+            for cat, cnt in sorted(
+                category_counts.items(), key=lambda item: item[1], reverse=True
+            )[:8]:
+                md += f"| {_normalize_body_text(cat)} | {cnt} |\n"
+            md += "\n"
+
+        md += "<div style='page-break-after: always;'></div>\n\n"
+
+        # ==============================================================================
+        # 5. 未来趋势与战略预警 (Forecast)
+        # ==============================================================================
+        md += "## 第四部分：未来趋势与战略预警\n\n"
 
         # 适配新版 Schema (TrendForecastReport: target_period, topics)
         topics = d_trend.get("topics", [])
@@ -693,15 +1011,46 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
                 bg = topic.get("background")
                 if bg:
                     md += f"> **背景导语**：{_normalize_body_text(bg)}\n\n"
+                main_tension = topic.get("main_tension")
+                audience = topic.get("audience")
+                scene_opening = topic.get("scene_opening")
+                points = topic.get("points", [])
+                if not audience:
+                    audience = next(
+                        (
+                            point.get("audience")
+                            for point in points
+                            if point.get("audience")
+                        ),
+                        "",
+                    )
+                if not scene_opening:
+                    scene_opening = next(
+                        (point.get("scene") for point in points if point.get("scene")),
+                        "",
+                    )
+                if main_tension or audience or scene_opening:
+                    summary_parts = []
+                    if main_tension:
+                        summary_parts.append(
+                            f"核心矛盾：{_normalize_body_text(main_tension)}"
+                        )
+                    if audience:
+                        summary_parts.append(
+                            f"涉及人群：{_normalize_body_text(audience)}"
+                        )
+                    if scene_opening:
+                        summary_parts.append(
+                            f"典型场景：{_normalize_body_text(scene_opening)}"
+                        )
+                    md += f"> **预警摘要**：{'；'.join(summary_parts)}\n\n"
 
                 # 风险点
-                points = topic.get("points", [])
                 for point in points:
                     sub = point.get("subtitle", "")
-                    content = point.get("content", "")
-                    # 移除可能重复的编号
+                    content = _compose_forecast_summary_paragraph(point)
                     md += f"#### {sub}\n"
-                    md += f"{_normalize_body_text(content)}\n\n"
+                    md += f"**研判**：{_normalize_body_text(content)}\n\n"
         else:
             md += "（暂无预测数据）\n"
 
@@ -785,9 +1134,7 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
 
             # 条款引用统计：强制使用检索到的数据库 metadata (matched_laws)，不使用 LLM 生成的 evidence_report.cited_laws
             for law in info.get("matched_laws") or []:
-                cat = (law or {}).get("category") or "未知标签"
-                article = (law or {}).get("article") or "未知条款"
-                key = f"{cat} / {article}"
+                key = _law_entry_bucket(law)
                 law_counts[key] = law_counts.get(key, 0) + 1
 
             suggestion = (info.get("evidence_report") or {}).get("disposal_suggestion")
@@ -875,129 +1222,79 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
         else:
             md += "（本期未生成可统计的条款引用数据）\n\n"
 
-        # (5) 案例明细（按事件分组展示）
-        md += "### 5) 案例明细（按事件分组）\n\n"
-
-        # 按事件分组
-        events_violations: Dict[str, List] = {}
+        # (5) 违规案例明细（按事件分组、逐条展开）
+        md += "### 5) 违规案例明细\n\n"
+        event_num = 0
+        case_num = 0
         for v in c_violations:
-            ename = v.get("event_name") or "未知"
-            if ename not in events_violations:
-                events_violations[ename] = []
-            events_violations[ename].append(v)
+            event_name = v.get("event_name") or "未知"
+            info = v.get("violation_info") or {}
+            evidence_report = info.get("evidence_report") or {}
 
-        event_num = 0  # 事件序号
-        case_num = 0  # 全局案例序号
-        for event_name, violations in events_violations.items():
+            cases_for_appendix = []
+            if info.get("post_case"):
+                post_case = info.get("post_case") or {}
+                if _normalize_body_text(post_case.get("primary_law", "")):
+                    cases_for_appendix.append(("帖子", post_case))
+            for case in info.get("comment_cases") or []:
+                if _normalize_body_text(case.get("primary_law", "")):
+                    cases_for_appendix.append(("评论", case))
+
+            if not cases_for_appendix:
+                continue
+
             event_num += 1
             md += f"#### {event_num}. {_esc_cell(event_name)}\n\n"
-            # 6列表格：序号 | 风险 | 违规内容 | 判定理由 | 违反条款 | 处置建议
-            md += "| 序号 | 风险 | 违规内容 | 判定理由 | 违反条款 | 处置建议 |\n"
-            md += "| :---: | :---: | :--- | :--- | :--- | :--- |\n"
 
-            for v in violations:
+            for source_type, case in cases_for_appendix:
                 case_num += 1
-                info = v.get("violation_info") or {}
-                if info is None:
-                    continue
-
-                # 内容过滤拦截的帖子：填充"审查受限"而非留空
-                if info.get("content_filter_blocked"):
-                    post_content = v.get("post_content", "")
-                    truncated = (
-                        post_content.strip()[:40] + "..."
-                        if len(post_content.strip()) > 40
-                        else post_content.strip()
-                    )
-                    md += (
-                        f"| {case_num} | - | "
-                        f"【帖】{_esc_cell(truncated) if truncated else '-'} | "
-                        f" | "
-                        f"建议人工复审 | "
-                        f"人工复审 |\n"
-                    )
-                    continue
-
-                risk = (
-                    info.get("overall_risk_level")
-                    or (info.get("evidence_report") or {}).get("overall_risk_level")
-                    or "Low"
+                quote = _normalize_body_text(case.get("quote", ""))
+                reasoning = _normalize_body_text(
+                    case.get("reasoning") or evidence_report.get("reasoning") or ""
                 )
-
-                evidence_report = info.get("evidence_report") or {}
-
-                # 违规内容
-                violation_text_parts = []
-                post_content = v.get("post_content", "")
-                is_post_violated = info.get("is_post_violated", False)
-                if is_post_violated and post_content:
-                    truncated = post_content.strip()[:60]
-                    if len(post_content.strip()) > 60:
-                        truncated += "..."
-                    violation_text_parts.append(f"【帖】{_esc_cell(truncated)}")
-
-                violated_comment_originals = v.get("violated_comment_originals", [])
-                seen_comments = set()
-
-                if violated_comment_originals:
-                    for vc in violated_comment_originals:
-                        content = vc.get("content", "")
-
-                        # 【修改】完全去掉数量限制和长度截断
-                        if content and content not in seen_comments:
-                            seen_comments.add(content)
-
-                            # 直接使用 content.strip()，不再使用 [:50] 截断
-                            # 也不再检查 comment_count 计数器
-                            violation_text_parts.append(
-                                f"【评】{_esc_cell(content.strip())}"
-                            )
-
-                violation_cell = (
-                    "<br>".join(violation_text_parts) if violation_text_parts else "-"
+                primary_law = _normalize_body_text(case.get("primary_law", ""))
+                disposal = _normalize_body_text(
+                    case.get("disposal_suggestion")
+                    or evidence_report.get("disposal_suggestion")
+                    or "建议人工研判"
                 )
-
-                # 判定理由
-                evidence_reasoning = evidence_report.get("reasoning")
-                if evidence_reasoning:
-                    reasoning_cell = evidence_reasoning.strip()[:80]
-                    if len(evidence_reasoning.strip()) > 80:
-                        reasoning_cell += "..."
-                    reasoning_cell = _esc_cell(reasoning_cell)
+                risk_level = _normalize_body_text(
+                    case.get("risk_level") or info.get("overall_risk_level") or "Low"
+                )
+                category = _normalize_body_text(case.get("category", "未标注类别"))
+                if source_type == "评论":
+                    post_preview = _normalize_body_text(v.get("post_content") or "")
+                    if len(post_preview) > 80:
+                        post_preview = post_preview[:80].rstrip() + "..."
+                    evidence_chain = "；".join(
+                        [
+                            f"所属帖子：{post_preview}",
+                            f"评论原文：{quote}",
+                        ]
+                    ).strip("；")
                 else:
-                    reasoning_cell = "-"
+                    evidence_chain = f"帖子原文：{quote}"
 
-                # 违反条款：使用 matched_laws 的 metadata，格式：《《微博社区公约》》+article：+ category+behavior
-                law_parts = []
-                for law in info.get("matched_laws") or []:
-                    if not law:
-                        continue
-                    art = law.get("article", "")
-                    cat = law.get("category", "")
-                    behavior = law.get("full_desc", "")
-                    text = f"《《微博社区公约》》{art}：{cat}\n{behavior}".strip()
-                    law_parts.append(text)
-                # 使用换行符分隔多个条款，_esc_cell 会把换行替换成 <br>，确保表格中逐条换行显示
-                law_cell = _esc_cell("\n".join(law_parts)) if law_parts else "-"
-
-                # 处置建议（不截断，保留完整文本）
-                suggestion = evidence_report.get("disposal_suggestion")
-                if suggestion:
-                    # 直接转义并保留完整建议内容，避免信息丢失
-                    suggestion_cell = _esc_cell(suggestion.strip())
-                else:
-                    suggestion_cell = "-"
-
-                md += f"| {case_num} | {_esc_cell(risk)} | {violation_cell} | {reasoning_cell} | {law_cell} | {suggestion_cell} |\n"
-
-            md += "\n"
+                md += f"**案例 {case_num}**\n\n"
+                md += f"**来源类型**：{source_type}\n\n"
+                md += f"**所属事件**：{_normalize_body_text(event_name)}\n\n"
+                md += f"**违规类别**：{category}\n\n"
+                md += f"**风险等级**：{risk_level}\n\n"
+                md += f"**违规摘录**：{quote}\n\n"
+                md += f"**判定理由**：{reasoning}\n\n"
+                md += f"**主要依据**：{primary_law}\n\n"
+                md += f"**证据链**：{_normalize_body_text(evidence_chain or '已记录原始内容上下文')}\n\n"
+                md += f"**处置建议**：{disposal}\n\n"
+                law_reason = _normalize_body_text(case.get("law_reason", ""))
+                if law_reason:
+                    md += f"**法规说明**：{law_reason}\n\n"
+                md += "---\n\n"
 
         return md
 
     def _save_markdown(self, md_content: str, filename: str) -> str:
         """
-        保存 Markdown 文件
-         不再生成 PDF（xhtml2pdf 中文支持差），建议用 Typora/VS Code 打开 .md 导出
+        保存 Markdown 兼容导出文件。
         """
         output_dir = "output"
         os.makedirs(output_dir, exist_ok=True)
@@ -1010,6 +1307,34 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
             return md_path
         except Exception as e:
             logger.error(f" Markdown 保存失败: {e}")
+            return ""
+
+    def _save_json(self, report_doc: Dict[str, Any], path: str) -> str:
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(report_doc, file, ensure_ascii=False, indent=2)
+            logger.info(f" JSON 报告已保存: {path}")
+            return path
+        except Exception as e:
+            logger.error(f" JSON 保存失败: {e}")
+            return ""
+
+    def _save_html(self, report_doc: Dict[str, Any], path: str) -> str:
+        try:
+            save_report_html(report_doc, path)
+            logger.info(f" HTML 报告已保存: {path}")
+            return path
+        except Exception as e:
+            logger.error(f" HTML 保存失败: {e}")
+            return ""
+
+    def _save_pdf(self, report_doc: Dict[str, Any], path: str) -> str:
+        try:
+            save_report_pdf(report_doc, path)
+            logger.info(f" PDF 报告已保存: {path}")
+            return path
+        except Exception as e:
+            logger.error(f" PDF 保存失败: {e}")
             return ""
 
 

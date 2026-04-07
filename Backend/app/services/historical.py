@@ -5,10 +5,9 @@ from typing import Dict, Any, List, Optional
 from dateutil.relativedelta import relativedelta
 import concurrent.futures
 
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import settings
+from app.core.llm_factory import get_main_llm
 from app.core.logger import logger
 from app.core.schemas import HistoricalDailyEvent, HistoricalEventsList, HistoricalSummary
 from app.core.prompts import AGENT_HISTORICAL_DAILY_EXTRACT_TEMPLATE, AGENT_HISTORICAL_SUMMARY_TEMPLATE
@@ -22,10 +21,7 @@ class AgentHistorical:
     """
 
     def __init__(self):
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,
+        self.llm = get_main_llm(
             temperature=0.3,
             request_timeout=60,
             max_retries=2,

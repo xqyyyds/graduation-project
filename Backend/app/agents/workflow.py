@@ -20,8 +20,6 @@ from app.agents.quality_gate import (
     quality_gate_d_node,
     route_after_bc_gate,
     route_after_d_gate,
-    retry_counter_b_node,
-    retry_counter_c_node,
     retry_counter_d_node,
 )
 
@@ -70,9 +68,6 @@ def create_workflow():
 
     # --- 质量门控阶段 ---
     workflow.add_node("quality_gate_bc", quality_gate_bc_node)  # Step 3: BC 质量评估
-    workflow.add_node("retry_counter_b", retry_counter_b_node)  # 重试计数器 B
-    workflow.add_node("retry_counter_c", retry_counter_c_node)  # 重试计数器 C
-
     # --- 趋势预测阶段 ---
     # workflow.add_node("agent_historical", agent_historical_node)  # 暂不启用
     workflow.add_node("agent_d", agent_d_node)  # Step 4: 趋势预测
@@ -111,15 +106,8 @@ def create_workflow():
         route_after_bc_gate,
         {
             "continue_to_d": "agent_d",  # 通过 → D
-            # "continue_to_historical": "agent_historical",  # 暂不启用
-            "retry_b": "retry_counter_b",  # B 不合格 → 重试 B
-            "retry_c": "retry_counter_c",  # C 不合格 → 重试 C
         },
     )
-
-    # --- 重试回路 ---
-    workflow.add_edge("retry_counter_b", "agent_b_analyze")  # B 重试
-    workflow.add_edge("retry_counter_c", "agent_c")  # C 重试
 
     # --- BC 通过后：D → 质量门控 ---
     workflow.add_edge("agent_d", "quality_gate_d")

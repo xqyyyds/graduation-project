@@ -1,1 +1,1 @@
-# API Module
+"""FastAPI application package."""

@@ -1,12 +1,14 @@
 import os
 import shutil
 from typing import List, Optional
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
+from chromadb.config import Settings as ChromaClientSettings
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.config import settings
+from app.core.llm_factory import get_main_llm
 from app.core.logger import logger
 
 
@@ -73,6 +75,11 @@ class ChromaManager:
             persist_directory=self.persist_dir,
             embedding_function=self.embedding_fn,
             collection_name="weibo_audit_rules",
+            client_settings=ChromaClientSettings(
+                is_persistent=True,
+                persist_directory=self.persist_dir,
+                anonymized_telemetry=False,
+            ),
         )
         logger.info(f" [ChromaDB] 向量库加载成功，路径: {self.persist_dir}")
 
@@ -151,7 +158,12 @@ class ChromaManager:
 
         增加了输入脱敏，降低 content_filter 触发概率。
         """
-        if not settings.ZHIPU_API_KEY:
+        main_llm = get_main_llm(
+            temperature=0.3,
+            request_timeout=30,
+            max_retries=1,
+        )
+        if not getattr(main_llm, "openai_api_key", None):
             return None
 
         # --- 输入脱敏：移除/遮盖敏感词，降低 HyDE 请求被过滤概率 ---
@@ -162,15 +174,7 @@ class ChromaManager:
             logger.info(" [RAG-HyDE] 跳过：脱敏后内容过短")
             return None
 
-        llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,
-            temperature=0.3,
-            request_timeout=30,
-            max_retries=1,
-        )
-        chain = _HYDE_PROMPT | llm
+        chain = _HYDE_PROMPT | main_llm
         result = chain.invoke({"query": sanitized_query})
         content = result.content.strip()
         return content if len(content) > 5 else None

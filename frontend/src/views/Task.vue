@@ -93,6 +93,14 @@
               </el-radio-group>
             </el-form-item>
 
+            <el-form-item label="审核策略 (Audit Strategy)">
+              <el-switch
+                v-model="taskForm.force_audit_update"
+                active-text="强制重审（忽略已审核缓存）"
+                inactive-text="复用已审核结果"
+              />
+            </el-form-item>
+
             <div class="form-footer">
               <el-button
                 type="primary"
@@ -162,7 +170,10 @@
             <div class="progress-section">
               <div class="progress-header">
                 <span class="p-label"
-                  >Current Phase: {{ currentTask.current_step }}</span
+                  >Current Phase:
+                  {{
+                    currentTask.stage_label || currentTask.current_step
+                  }}</span
                 >
                 <span class="p-val">{{ currentTask.progress }}%</span>
               </div>
@@ -187,7 +198,7 @@
                 @click="viewReport"
                 class="action-btn"
               >
-                <el-icon><DocumentChecked /></el-icon> 查看报告
+                <el-icon><DocumentChecked /></el-icon> 查看最新成品
               </el-button>
               <el-button @click="resetTask" class="action-btn">
                 <el-icon><RefreshRight /></el-icon> 重置
@@ -206,7 +217,7 @@
         <div
           class="pipeline-node"
           v-for="(step, idx) in workflowSteps"
-          :key="idx"
+          :key="step.id"
           :class="{
             'is-active': isStepActive(step),
             'is-done': isStepCompleted(step),
@@ -220,7 +231,7 @@
             <span v-else>{{ idx + 1 }}</span>
           </div>
           <div class="node-content">
-            <span class="node-title">{{ step }}</span>
+            <span class="node-title">{{ step.label }}</span>
           </div>
         </div>
       </div>
@@ -235,6 +246,13 @@ import { useRouter } from "vue-router";
 import { useAppStore } from "../stores/app";
 import { ElMessage } from "element-plus";
 import dayjs from "dayjs";
+import {
+  WORKFLOW_STEPS,
+  getCurrentStepIndex,
+  getStepIndex,
+  isStepActive as calcStepActive,
+  isStepCompleted as calcStepCompleted,
+} from "./taskProgress";
 
 const router = useRouter();
 const store = useAppStore();
@@ -243,6 +261,7 @@ const isSubmitting = ref(false);
 
 const categories = computed(() => store.categories);
 const forecastRanges = computed(() => store.forecastRanges);
+const reports = computed(() => store.reports);
 // 直接使用 store 中的 ref，这样在脚本中访问时可以用 currentTask.value 获取真实对象
 const { currentTask, taskStartTime } = storeToRefs(store);
 const isTaskRunning = computed(() => store.isTaskRunning);
@@ -309,7 +328,7 @@ watch(
       elapsedTime.value = 0;
     }
   },
-  { immediate: true } // 立即执行，确保刷新页面后能从 localStorage 恢复计时
+  { immediate: true }, // 立即执行，确保刷新页面后能从 localStorage 恢复计时
 );
 
 onUnmounted(() => stopTimer());
@@ -325,7 +344,7 @@ const formatDuration = (ms) => {
   const m = Math.floor((totalSeconds % 3600) / 60);
   const s = totalSeconds % 60;
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(
-    s
+    s,
   ).padStart(2, "0")}`;
 };
 
@@ -334,17 +353,10 @@ const taskForm = reactive({
   startDate: null,
   endDate: null,
   forecast_range: "1m",
+  force_audit_update: false,
 });
 
-const workflowSteps = [
-  "数据分类",
-  "数据准备",
-  "观点分析",
-  "合规审查",
-  "质量评估",
-  "趋势预测",
-  "报告生成",
-];
+const workflowSteps = WORKFLOW_STEPS;
 
 const rules = {
   category: [{ required: true, message: "请选择类别", trigger: "change" }],
@@ -393,6 +405,7 @@ const submitTask = async () => {
           forecast_range: taskForm.forecast_range,
           start_date: dayjs(taskForm.startDate).format("YYYY-MM-DD"),
           end_date: dayjs(taskForm.endDate).format("YYYY-MM-DD"),
+          force_audit_update: taskForm.force_audit_update,
         });
         ElMessage.success("指令已下发，任务开始执行");
       } catch (e) {
@@ -405,29 +418,49 @@ const submitTask = async () => {
 };
 
 const getStatusType = (s) =>
-  ({ running: "primary", completed: "success", failed: "danger" }[s] || "info");
+  ({ running: "primary", completed: "success", failed: "danger" })[s] || "info";
 const getStatusText = (s) =>
-  ({ running: "运行中", completed: "已完成", failed: "执行失败" }[s] ||
-  "等待中");
+  ({ running: "运行中", completed: "已完成", failed: "执行失败" })[s] ||
+  "等待中";
 const getProgressStatus = (s) =>
-  ({ completed: "success", failed: "exception" }[s] || "");
+  ({ completed: "success", failed: "exception" })[s] || "";
 
-const getStepIndex = (stepName) => workflowSteps.indexOf(stepName);
-const currentStepIndex = computed(() =>
-  currentTask.value ? getStepIndex(currentTask.value.current_step) : -1
-);
+const currentStepIndex = computed(() => getCurrentStepIndex(currentTask.value));
 
-const isStepActive = (step) =>
-  currentTask.value?.status === "running" &&
-  currentTask.value.current_step === step;
-const isStepCompleted = (step) => {
-  if (!currentTask.value) return false;
-  if (currentTask.value.status === "completed") return true;
-  const idx = getStepIndex(step);
-  return idx !== -1 && idx < currentStepIndex.value;
+const isStepActive = (step) => calcStepActive(currentTask.value, step);
+const isStepCompleted = (step) => calcStepCompleted(currentTask.value, step);
+
+const viewReport = async () => {
+  try {
+    await store.fetchReports();
+    const targetCategory =
+      currentTask.value?.category || taskForm.category || "综合";
+    const candidate = [...reports.value]
+      .filter((item) =>
+        targetCategory ? item.category === targetCategory : true,
+      )
+      .sort((a, b) =>
+        (b.created_at || "").localeCompare(a.created_at || ""),
+      )[0];
+
+    if (candidate?.filename) {
+      router.push({
+        name: "ReportDetail",
+        params: { filename: candidate.filename },
+      });
+      return;
+    }
+  } catch (error) {
+    console.error("跳转报告详情失败，回退到报告中心", error);
+  }
+
+  router.push({
+    name: "Reports",
+    query: {
+      category: currentTask.value?.category || taskForm.category || "综合",
+    },
+  });
 };
-
-const viewReport = () => router.push("/reports");
 const resetTask = () => {
   store.clearCurrentTask(); // 这会同时重置 store.taskStartTime
   elapsedTime.value = 0;

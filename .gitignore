@@ -4,6 +4,9 @@
 /Backend/output
 /Backend/logs
 /Backend/__pycache__/
+/app/
+/output/artifact-test-*/
+/output/*.tmp
 
 
 # 常见忽略项（可选）

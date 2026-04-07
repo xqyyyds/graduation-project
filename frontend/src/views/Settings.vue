@@ -34,17 +34,51 @@
             <el-input
               v-model.number="backendForm.timeout"
               type="number"
+              min="1"
               placeholder="60"
             >
               <template #prefix><el-icon><Timer /></el-icon></template>
             </el-input>
           </el-form-item>
 
+          <div class="form-tip">
+            当前日志连接会自动跟随后端地址派生，无需单独填写 WebSocket 地址。
+          </div>
+
+          <div class="connection-preview">
+            <div class="preview-row">
+              <span class="preview-label">当前 API 地址</span>
+              <code>{{ normalizedBackendUrl }}</code>
+            </div>
+            <div class="preview-row">
+              <span class="preview-label">派生日志地址</span>
+              <code>{{ websocketPreview }}</code>
+            </div>
+          </div>
+
+          <div v-if="backendDirty" class="masked-tip">
+            你已修改连接设置但尚未保存。测试连接会使用当前表单值；页面里的 API 请求和日志重连将在保存后统一切换。
+          </div>
+
           <div class="form-actions">
-            <el-button type="primary" plain @click="testConnection">
+            <el-button type="primary" @click="saveBackendSettings">
+              保存设置
+            </el-button>
+            <el-button plain :loading="testingConnection" @click="testConnection">
               测试连接
             </el-button>
           </div>
+
+          <transition name="fade">
+            <el-alert
+              v-if="connectionResult"
+              :type="connectionResult.status === 'ok' ? 'success' : 'error'"
+              :title="connectionResult.message"
+              :description="connectionResult.description"
+              show-icon
+              style="margin-top: 12px"
+            />
+          </transition>
         </el-form>
       </el-card>
 
@@ -86,7 +120,7 @@
         </div>
       </el-card>
 
-      <el-card class="settings-card" shadow="never">
+      <el-card class="settings-card llm-card" shadow="never">
         <template #header>
           <div class="card-header">
             <span class="header-title">
@@ -98,56 +132,147 @@
           </div>
         </template>
 
-        <el-form label-position="top" :model="llmForm" class="content-form">
-          <el-form-item label="模型名称 (Model Name)">
-            <el-input v-model="llmForm.model" placeholder="gpt-4o-mini">
-              <template #prefix><el-icon><Box /></el-icon></template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="API Base URL">
-            <el-input
-              v-model="llmForm.baseUrl"
-              placeholder="https://api.zetatechs.com/v1"
-            >
-              <template #prefix><el-icon><Link /></el-icon></template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="API Key">
-            <el-input
-              v-model="llmForm.apiKey"
-              type="password"
-              show-password
-              placeholder="sk-..."
-            >
-              <template #prefix><el-icon><Key /></el-icon></template>
-            </el-input>
-            <div
-              v-if="llmForm.apiKey && llmForm.apiKey.includes('*')"
-              style="margin-top: 8px; color: var(--text-muted); font-size: 12px"
-            >
-              当前显示为已保存的掩码密钥；如需测试或替换，请输入完整密钥并保存。
+        <div class="llm-groups">
+          <section class="llm-group">
+            <div class="llm-group-header">
+              <div>
+                <h3>主模型配置</h3>
+                <p>当前系统处于单模型模式，所有链路统一复用这一套模型配置。</p>
+              </div>
+              <el-tag type="success" effect="plain">单模型模式</el-tag>
             </div>
-          </el-form-item>
 
-          <div class="form-actions">
-            <el-button type="primary" @click="saveLLMConfig">保存配置</el-button>
-            <el-button plain :loading="testingLLM" @click="testLLM">
-              测试连通性
-            </el-button>
+            <el-form label-position="top" :model="llmForm.main" class="content-form">
+              <el-form-item label="模型名称 (Model Name)">
+                <el-input v-model="llmForm.main.model" placeholder="例如 deepseek-v3-2-251201">
+                  <template #prefix><el-icon><Box /></el-icon></template>
+                </el-input>
+              </el-form-item>
+
+              <el-form-item label="API Base URL">
+                <el-input
+                  v-model="llmForm.main.baseUrl"
+                  placeholder="https://ark.cn-beijing.volces.com/api/v3"
+                >
+                  <template #prefix><el-icon><Link /></el-icon></template>
+                </el-input>
+              </el-form-item>
+
+              <el-form-item label="API Key">
+                <el-input
+                  v-model="llmForm.main.apiKey"
+                  type="password"
+                  show-password
+                  placeholder="输入完整密钥后保存"
+                >
+                  <template #prefix><el-icon><Key /></el-icon></template>
+                </el-input>
+                <div v-if="showMaskedHint(llmForm.main.apiKey)" class="masked-tip">
+                  当前显示为已保存的掩码密钥；如需替换或测试，请重新输入完整密钥。
+                </div>
+              </el-form-item>
+
+              <div class="form-actions">
+                <el-button type="primary" @click="saveLLMConfig">
+                  保存配置
+                </el-button>
+                <el-button
+                  plain
+                  :loading="testingLLM"
+                  @click="testLLM"
+                >
+                  测试主模型
+                </el-button>
+              </div>
+            </el-form>
+          </section>
+        </div>
+
+        <el-alert
+          class="runtime-alert"
+          type="info"
+          show-icon
+          :closable="false"
+          title="当前配置为运行时保存"
+          description="当前为单模型模式：保存后会立即作用于当前服务进程；若后端重启，需重新加载或另做持久化。"
+        />
+
+        <transition name="fade">
+          <el-alert
+            v-if="llmTestResult"
+            :type="llmTestResult.status === 'ok' ? 'success' : 'error'"
+            :title="llmTestResult.message"
+            show-icon
+            style="margin-top: 12px"
+          />
+        </transition>
+      </el-card>
+
+      <el-card class="settings-card" shadow="never">
+        <template #header>
+          <div class="card-header">
+            <span class="header-title">
+              <div class="icon-box blue">
+                <el-icon><Search /></el-icon>
+              </div>
+              联网搜索配置
+            </span>
+          </div>
+        </template>
+
+        <section class="llm-group">
+          <div class="llm-group-header">
+            <div>
+              <h3>Tavily 搜索</h3>
+              <p>用于深读补背景、历史同期搜索和未来趋势信号检索。</p>
+            </div>
+            <el-tag type="info" effect="plain">运行时配置</el-tag>
           </div>
 
-          <transition name="fade">
-            <el-alert
-              v-if="llmTestResult"
-              :type="llmTestResult.status === 'ok' ? 'success' : 'error'"
-              :title="llmTestResult.message"
-              show-icon
-              style="margin-top: 12px"
-            />
-          </transition>
-        </el-form>
+          <el-form label-position="top" :model="searchForm" class="content-form">
+            <el-form-item label="Tavily API Key">
+              <el-input
+                v-model="searchForm.tavilyApiKey"
+                type="password"
+                show-password
+                placeholder="输入完整 Tavily API Key"
+              >
+                <template #prefix><el-icon><Key /></el-icon></template>
+              </el-input>
+              <div v-if="showMaskedHint(searchForm.tavilyApiKey)" class="masked-tip">
+                当前显示为已保存的掩码密钥；如需替换或测试，请重新输入完整密钥。
+              </div>
+            </el-form-item>
+
+            <div class="form-actions">
+              <el-button type="primary" @click="saveSearchConfig">
+                保存配置
+              </el-button>
+              <el-button plain :loading="testingSearch" @click="testSearch">
+                测试 Tavily
+              </el-button>
+            </div>
+          </el-form>
+        </section>
+
+        <el-alert
+          class="runtime-alert"
+          type="info"
+          show-icon
+          :closable="false"
+          title="联网搜索配置为运行时保存"
+          description="保存后会立即作用于当前服务进程；若后端重启，需重新加载或另做持久化。"
+        />
+
+        <transition name="fade">
+          <el-alert
+            v-if="searchTestResult"
+            :type="searchTestResult.status === 'ok' ? 'success' : 'error'"
+            :title="searchTestResult.message"
+            show-icon
+            style="margin-top: 12px"
+          />
+        </transition>
       </el-card>
 
       <el-card class="about-card" shadow="never">
@@ -160,8 +285,7 @@
 
           <div class="desc-container">
             <p class="desc">
-              基于 LangGraph
-              多智能体协作架构，集成热搜聚类、深度观点分析与趋势预测的下一代舆情系统。
+              基于 LangGraph 多智能体协作架构，集成热点梳理、风险审查、趋势预警与多格式报告导出的舆情分析系统。
             </p>
           </div>
 
@@ -182,7 +306,11 @@
 import { reactive, onMounted, computed, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { useAppStore } from "../stores/app";
-import api from "../api";
+import api, {
+  deriveWsUrl,
+  getBaseUrl,
+  notifySettingsUpdated,
+} from "../api";
 import {
   Connection,
   Link,
@@ -192,16 +320,29 @@ import {
   Key,
   DataAnalysis,
   Timer,
+  Search,
 } from "@element-plus/icons-vue";
 
 const store = useAppStore();
 
 const backendForm = reactive({ url: "http://localhost:8000", timeout: 60 });
 const llmForm = reactive({
-  model: "gpt-4o-mini",
-  baseUrl: "https://api.zetatechs.com/v1",
-  apiKey: "sk-89s7d8f7s8d7f8s7d8f7s8d7f8s7d8f",
+  main: {
+    model: "",
+    baseUrl: "",
+    apiKey: "",
+  },
 });
+const searchForm = reactive({
+  tavilyApiKey: "",
+});
+
+const testingConnection = ref(false);
+const connectionResult = ref(null);
+const testingLLM = ref(false);
+const llmTestResult = ref(null);
+const testingSearch = ref(false);
+const searchTestResult = ref(null);
 
 const themeColors = [
   { key: "blue", val: "#3b82f6" },
@@ -232,6 +373,20 @@ const activeTheme = computed(() => {
   return match ? match.key : "blue";
 });
 
+const normalizedBackendUrl = computed(() => {
+  const value = (backendForm.url || "").trim();
+  return value ? value.replace(/\/$/, "") : getBaseUrl();
+});
+
+const websocketPreview = computed(() => deriveWsUrl(normalizedBackendUrl.value));
+const backendDirty = computed(
+  () =>
+    normalizedBackendUrl.value !== getBaseUrl() ||
+    Number(backendForm.timeout || 60) !== Number(store.settings.timeout || 60)
+);
+
+const showMaskedHint = (value) => value && value.includes("*");
+
 const setTheme = (key) => {
   const colorObj = themeColors.find((c) => c.key === key);
   if (colorObj) {
@@ -244,36 +399,88 @@ const setTheme = (key) => {
   }
 };
 
-const testConnection = () => {
-  ElMessage.info("正在尝试连接后端...");
-  setTimeout(() => ElMessage.success("后端服务连接成功 (12ms)"), 800);
+const loadBackendSettings = () => {
+  backendForm.url = store.settings.apiUrl || "http://localhost:8000";
+  backendForm.timeout = Number(store.settings.timeout || 60);
 };
 
-const testingLLM = ref(false);
-const llmTestResult = ref(null);
+const saveBackendSettings = () => {
+  const normalizedUrl = normalizedBackendUrl.value;
+  const normalizedTimeout = Number(backendForm.timeout) || 60;
+  store.updateSettings({
+    apiUrl: normalizedUrl || "http://localhost:8000",
+    timeout: normalizedTimeout,
+  });
+  notifySettingsUpdated({
+    apiUrl: normalizedUrl || "http://localhost:8000",
+    timeout: normalizedTimeout,
+  });
+  connectionResult.value = null;
+  ElMessage.success("后端连接设置已保存");
+};
+
+const testConnection = async () => {
+  testingConnection.value = true;
+  connectionResult.value = null;
+  try {
+    const result = await api.testBackendConnection({
+      url: backendForm.url,
+      timeout: backendForm.timeout,
+    });
+    connectionResult.value = {
+      status: "ok",
+      message: "后端连接成功",
+      description: `延迟 ${result.latency}ms，时间戳 ${result.timestamp}`,
+    };
+    ElMessage.success(`后端服务连接成功 (${result.latency}ms)`);
+  } catch (error) {
+    const message =
+      error?.response?.data?.detail ||
+      error?.message ||
+      "无法连接到指定后端服务";
+    connectionResult.value = {
+      status: "error",
+      message: "后端连接失败",
+      description: message,
+    };
+    ElMessage.error("后端连接失败：" + message);
+  } finally {
+    testingConnection.value = false;
+  }
+};
 
 const loadLLMSettings = async () => {
   try {
     const data = await api.getLLMSettings();
-    if (data) {
-      llmForm.model = data.model || "";
-      llmForm.baseUrl = data.base_url || "";
-      llmForm.apiKey = data.api_key || "";
-    }
+    if (!data) return;
+    llmForm.main.model = data.main?.model || "";
+    llmForm.main.baseUrl = data.main?.base_url || "";
+    llmForm.main.apiKey = data.main?.api_key || "";
   } catch (error) {
     console.error("加载 LLM 设置失败", error);
+  }
+};
+
+const loadSearchSettings = async () => {
+  try {
+    const data = await api.getSearchSettings();
+    searchForm.tavilyApiKey = data?.tavily_api_key || "";
+  } catch (error) {
+    console.error("加载联网搜索设置失败", error);
   }
 };
 
 const saveLLMConfig = async () => {
   try {
     const res = await api.updateLLMSettings({
-      model: llmForm.model,
-      base_url: llmForm.baseUrl,
-      api_key: llmForm.apiKey,
+      main: {
+        model: llmForm.main.model,
+        base_url: llmForm.main.baseUrl,
+        api_key: llmForm.main.apiKey,
+      },
     });
     ElMessage.success(res?.message || "LLM 配置已保存");
-    await testLLM();
+    await loadLLMSettings();
   } catch (error) {
     ElMessage.error("保存失败：" + (error?.message || error));
   }
@@ -284,33 +491,74 @@ const testLLM = async () => {
   llmTestResult.value = null;
 
   const payload = {
-    model: llmForm.model || undefined,
-    base_url: llmForm.baseUrl || undefined,
+    model: llmForm.main.model || undefined,
+    base_url: llmForm.main.baseUrl || undefined,
   };
-  if (llmForm.apiKey && !llmForm.apiKey.includes("*"))
-    payload.api_key = llmForm.apiKey;
+
+  if (llmForm.main.apiKey && !llmForm.main.apiKey.includes("*")) {
+    payload.api_key = llmForm.main.apiKey;
+  }
 
   try {
     const res = await api.testLLMConnection(payload);
     llmTestResult.value = res;
     if (res?.status === "ok") {
-      ElMessage.success(res.message || "LLM 连接成功");
-    } else {
-      console.warn("LLM 测试返回失败：", res);
+      ElMessage.success("主模型连通性测试成功");
     }
   } catch (error) {
-    console.error("LLM 测试异常：", error);
     llmTestResult.value = {
       status: "error",
       message: error?.message || String(error),
     };
+    ElMessage.error("主模型连通性测试失败");
   } finally {
     testingLLM.value = false;
   }
 };
 
-onMounted(() => {
-  loadLLMSettings();
+const saveSearchConfig = async () => {
+  try {
+    const res = await api.updateSearchSettings({
+      tavily_api_key: searchForm.tavilyApiKey,
+    });
+    ElMessage.success(res?.message || "联网搜索配置已保存");
+    await loadSearchSettings();
+  } catch (error) {
+    ElMessage.error("保存失败：" + (error?.message || error));
+  }
+};
+
+const testSearch = async () => {
+  testingSearch.value = true;
+  searchTestResult.value = null;
+  const payload = {};
+  if (searchForm.tavilyApiKey && !searchForm.tavilyApiKey.includes("*")) {
+    payload.tavily_api_key = searchForm.tavilyApiKey;
+  }
+
+  try {
+    const res = await api.testSearchConnection(payload);
+    searchTestResult.value = res;
+    if (res?.status === "ok") {
+      ElMessage.success("Tavily 连通性测试成功");
+    } else {
+      ElMessage.error(res?.message || "Tavily 连通性测试失败");
+    }
+  } catch (error) {
+    searchTestResult.value = {
+      status: "error",
+      message: error?.message || String(error),
+    };
+    ElMessage.error("Tavily 连通性测试失败");
+  } finally {
+    testingSearch.value = false;
+  }
+};
+
+onMounted(async () => {
+  loadBackendSettings();
+  await loadLLMSettings();
+  await loadSearchSettings();
 });
 </script>
 
@@ -402,6 +650,10 @@ onMounted(() => {
   background: #f59e0b;
   box-shadow: 0 4px 10px rgba(245, 158, 11, 0.2);
 }
+.icon-box.blue {
+  background: #3b82f6;
+  box-shadow: 0 4px 10px rgba(59, 130, 246, 0.2);
+}
 .card-header {
   display: flex;
   align-items: center;
@@ -420,9 +672,48 @@ onMounted(() => {
 }
 .form-actions {
   margin-top: auto;
-  padding-top: 24px;
+  padding-top: 16px;
   display: flex;
   gap: 12px;
+}
+.form-tip,
+.masked-tip {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.connection-preview {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--bg-body);
+  border: 1px solid var(--border-color);
+}
+
+.preview-row {
+  display: grid;
+  gap: 6px;
+}
+
+.preview-row + .preview-row {
+  margin-top: 10px;
+}
+
+.preview-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.connection-preview code {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+  font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+  color: var(--text-primary);
 }
 
 .pref-list {
@@ -471,7 +762,40 @@ onMounted(() => {
   box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.1);
 }
 
-/* About Card 样式 */
+.llm-card :deep(.el-card__body) {
+  gap: 16px;
+}
+.llm-groups {
+  display: grid;
+  gap: 16px;
+}
+.llm-group {
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  padding: 18px 18px 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent);
+}
+.llm-group-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.llm-group-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 16px;
+}
+.llm-group-header p {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.runtime-alert {
+  margin-top: 8px;
+}
+
 .about-card {
   background: var(
     --about-bg,
@@ -481,25 +805,21 @@ onMounted(() => {
   border: 1px solid var(--border-color);
   transition: background 0.3s, color 0.3s;
 }
-
-/* 🔥🔥 修复重点：添加居中对齐属性 🔥🔥 */
 .about-content {
   flex: 1;
   display: flex;
   flex-direction: column;
-  align-items: center;     /* 水平居中 */
-  justify-content: center; /* 垂直居中 */
-  text-align: center;      /* 文本居中 */
-  width: 100%;             /* 宽度撑满 */
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  width: 100%;
 }
-
 .about-content h3 {
   font-size: 22px;
   margin: 0 0 8px 0;
   font-weight: 700;
   color: var(--text-primary);
 }
-
 .logo-circle {
   width: 80px;
   height: 80px;
@@ -513,7 +833,6 @@ onMounted(() => {
   box-shadow: 0 10px 20px rgba(0, 0, 0, 0.05);
   color: var(--primary-color);
 }
-
 .version {
   color: var(--text-secondary);
   font-size: 12px;
@@ -522,7 +841,6 @@ onMounted(() => {
   padding: 4px 12px;
   border-radius: 12px;
 }
-
 .desc {
   color: var(--text-secondary);
   font-size: 14px;
@@ -530,12 +848,11 @@ onMounted(() => {
   max-width: 90%;
   margin: 0 auto 32px auto;
 }
-
 .tech-badges {
   display: flex;
   gap: 8px;
   margin-bottom: 24px;
-  justify-content: center; /* 徽标水平居中 */
+  justify-content: center;
 }
 .badge {
   background: var(--bg-body);
@@ -545,14 +862,12 @@ onMounted(() => {
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
 }
-
 .copyright {
   margin-top: auto;
   font-size: 12px;
   color: var(--text-muted);
 }
 
-/* 局部变量覆盖 */
 :root {
   --about-bg: linear-gradient(145deg, #ffffff 0%, #f1f5f9 100%);
   --about-logo-bg: rgba(37, 99, 235, 0.08);

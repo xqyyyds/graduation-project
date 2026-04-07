@@ -39,9 +39,13 @@ class GraphState(TypedDict):
     #  [新增] 类别筛选 (综合/社会/高校/生活/科技/政治/其他)
     category: Optional[str]  # 默认 "综合" 表示不筛选类别
 
+    #  [新增] 是否强制重审（忽略历史审核缓存）
+    force_audit_update: Optional[bool]
+
     # === 3. Agent A (统计分析师) 的产出 ===
     raw_trends: List[Dict]
     core_events: List[Dict]  # 这里会包含由 ETL 归并后的数据
+    focus_events: List[Dict]  # 前置圈定的5个重点事件（B/C并行复用）
 
     # === 4. Agent B (舆情观点分析师) 的产出 ===
     analyzed_events: List[Dict]
@@ -65,8 +69,8 @@ class GraphState(TypedDict):
     violation_stats: Dict[str, int]
 
     # === 8. 质量门控 (Agent 协作架构) ===
-    quality_scores: Dict[str, Any]      # {agent_name: QualityScore dict} 各 Agent 输出的质量评分
-    retry_count: Dict[str, int]         # {agent_name: count} 各 Agent 重试次数
+    quality_scores: Dict[str, Any]  # {agent_name: check_result dict} 各节点规则检查结果
+    retry_count: Dict[str, int]  # {agent_name: count} 各 Agent 重试次数
     supervisor_feedback: Annotated[str, _last_value]  # Supervisor 的整体反馈
 
     # === 9. 系统控制字段 ===

@@ -297,7 +297,11 @@ class MongoManager:
             )
 
     def get_comments_by_post_ids(
-        self, note_ids: List[str], limit: int = 200
+        self,
+        note_ids: List[str],
+        limit: int = 200,
+        sort_field: str = "comment_like_count",
+        descending: bool = True,
     ) -> List[Dict]:
         """
         根据帖子 note_id 列表，获取对应的评论数据。
@@ -309,13 +313,15 @@ class MongoManager:
 
         query = {"note_id": {"$in": note_ids}}
 
+        sort_order = DESCENDING if descending else 1
+
         # 这里加上 sort，确保 Agent B 分析的是热门观点
         #  修正：使用 collation 做数值排序
         try:
             return list(
                 self.db["weibo_comments"]
                 .find(query)
-                .sort("comment_like_count", DESCENDING)
+                .sort(sort_field, sort_order)
                 .collation({"locale": "en_US", "numericOrdering": True})
                 .limit(limit)
             )
@@ -324,9 +330,161 @@ class MongoManager:
             return list(
                 self.db["weibo_comments"]
                 .find(query)
-                .sort("comment_like_count", DESCENDING)
+                .sort(sort_field, sort_order)
                 .limit(limit)
             )
+
+    def get_grouped_comments_by_post_ids(
+        self,
+        note_ids: List[str],
+        limit_per_post: int = 20,
+        sort_field: str = "comment_like_count",
+        descending: bool = True,
+    ) -> Dict[str, List[Dict]]:
+        """
+        批量获取多个帖子的评论，并按 note_id 分组后截取每个帖子的前 N 条。
+        用于替代逐帖 N+1 查询，显著降低 Node A 的评论抓取次数。
+        """
+        if not note_ids:
+            return {}
+
+        sort_order = -1 if descending else 1
+        sort_expr = f"${sort_field}"
+        pipeline: List[Dict[str, Any]] = [{"$match": {"note_id": {"$in": note_ids}}}]
+
+        if sort_field in {"comment_like_count"}:
+            pipeline.append(
+                {
+                    "$addFields": {
+                        "__sort_value": {
+                            "$convert": {
+                                "input": sort_expr,
+                                "to": "double",
+                                "onError": 0,
+                                "onNull": 0,
+                            }
+                        }
+                    }
+                }
+            )
+            sort_key = "__sort_value"
+        else:
+            sort_key = sort_field
+
+        pipeline.extend(
+            [
+                {"$sort": {"note_id": 1, sort_key: sort_order}},
+                {"$group": {"_id": "$note_id", "docs": {"$push": "$$ROOT"}}},
+                {"$project": {"docs": {"$slice": ["$docs", limit_per_post]}}},
+            ]
+        )
+
+        grouped: Dict[str, List[Dict]] = {}
+        try:
+            for row in self.db["weibo_comments"].aggregate(pipeline, allowDiskUse=True):
+                grouped[str(row.get("_id") or "")] = row.get("docs") or []
+        except Exception as e:
+            logger.warning(f" [MongoDB] 批量分组抓取评论失败，降级逐帖查询: {e}")
+            for note_id in note_ids:
+                grouped[str(note_id)] = self.get_comments_by_post_ids(
+                    [note_id],
+                    limit=limit_per_post,
+                    sort_field=sort_field,
+                    descending=descending,
+                )
+        return grouped
+
+    def get_comment_candidates_by_post_id(
+        self,
+        note_id: str,
+        hot_limit: int = 60,
+        recent_limit: int = 40,
+    ) -> List[Dict]:
+        """
+        为审核链准备评论候选池：
+        - 高赞前 hot_limit 条
+        - 最新前 recent_limit 条
+        - 合并后按 comment_id / _id 去重
+        """
+        if not note_id:
+            return []
+
+        hot_comments = self.get_comments_by_post_ids(
+            [note_id],
+            limit=hot_limit,
+            sort_field="comment_like_count",
+            descending=True,
+        )
+        recent_comments = self.get_comments_by_post_ids(
+            [note_id],
+            limit=recent_limit,
+            sort_field="create_date_time",
+            descending=True,
+        )
+
+        merged: List[Dict] = []
+        seen = set()
+        for item in hot_comments + recent_comments:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                item.get("comment_id")
+                or (str(item.get("_id")) if item.get("_id") else "")
+                or item.get("content")
+            )
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
+
+    def get_comment_candidates_by_post_ids(
+        self,
+        note_ids: List[str],
+        hot_limit: int = 60,
+        recent_limit: int = 40,
+    ) -> Dict[str, List[Dict]]:
+        """
+        为多个帖子一次性准备评论候选池：
+        - 每帖高赞前 hot_limit 条
+        - 每帖最新前 recent_limit 条
+        - 按 comment_id / _id / content 去重
+        """
+        if not note_ids:
+            return {}
+
+        hot_grouped = self.get_grouped_comments_by_post_ids(
+            note_ids=note_ids,
+            limit_per_post=hot_limit,
+            sort_field="comment_like_count",
+            descending=True,
+        )
+        recent_grouped = self.get_grouped_comments_by_post_ids(
+            note_ids=note_ids,
+            limit_per_post=recent_limit,
+            sort_field="create_date_time",
+            descending=True,
+        )
+
+        result: Dict[str, List[Dict]] = {}
+        for note_id in note_ids:
+            key = str(note_id)
+            merged: List[Dict] = []
+            seen = set()
+            for item in (hot_grouped.get(key) or []) + (recent_grouped.get(key) or []):
+                if not isinstance(item, dict):
+                    continue
+                dedup_key = (
+                    item.get("comment_id")
+                    or (str(item.get("_id")) if item.get("_id") else "")
+                    or item.get("content")
+                )
+                if not dedup_key or dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                merged.append(item)
+            result[key] = merged
+        return result
 
     def get_pending_posts(self, batch_size: int = 50) -> List[Dict]:
         """
@@ -399,7 +557,23 @@ class MongoManager:
         self._bulk_update_audit("weibo_comments", updates)
 
     def save_report_session(self, session_data: Dict):
-        self.db["report_sessions"].insert_one(session_data)
+        payload = dict(session_data or {})
+        report_json = payload.get("report_json") or {}
+        meta = report_json.get("meta") or {}
+        payload.setdefault("render_version", meta.get("render_version") or "report_json_v2")
+        self.db["report_sessions"].insert_one(payload)
+
+    def get_report_session_by_filename(self, filename: str) -> Optional[Dict]:
+        escaped = re.escape(filename)
+        query = {
+            "$or": [
+                {"md_path": {"$regex": f"{escaped}$"}},
+                {"json_path": {"$regex": f"{re.escape(filename.replace('.md', '.json'))}$"}},
+                {"html_path": {"$regex": f"{re.escape(filename.replace('.md', '.html'))}$"}},
+                {"pdf_path": {"$regex": f"{re.escape(filename.replace('.md', '.pdf'))}$"}},
+            ]
+        }
+        return self.db["report_sessions"].find_one(query, sort=[("created_at", DESCENDING)])
 
     def get_report_history(self, limit: int = 10):
         return list(

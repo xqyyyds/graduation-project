@@ -14,7 +14,6 @@ from app.services.utils import get_web_context
 api_key = settings.TAVILY_API_KEY
 masked_key = api_key[:8] + "..." if api_key else "None"
 print(f"当前 TAVILY_API_KEY: {masked_key}")
-print(f"完整 Key: {api_key}")
 print(f"{'='*80}\n")
 
 # 测试搜索

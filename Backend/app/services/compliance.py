@@ -1,50 +1,50 @@
 import json
-import re
-from typing import Dict, Any, List
+import concurrent.futures
+from typing import Any, Dict, List, Optional, Tuple
 
-# LangChain 组件
-from langchain_openai import ChatOpenAI  # 推荐使用标准的 ChatOpenAI 类
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
+from pydantic import BaseModel, Field
 
-# 引入配置和数据库
-from app.core.config import settings
+from app.core.llm_factory import get_main_llm
 from app.core.logger import logger
-from app.db.chroma_manager import chroma_db
-
-#  引入分离出去的 Schema 和 Prompt
-from app.core.schemas import (
-    AuditAnalysis,
-    BatchComplianceResult,
-    ComplianceEvidenceReport,
-)
 from app.core.prompts import (
-    AGENT_C_BATCH_TEMPLATE,
+    AGENT_C_CATEGORY_RECHECK_TEMPLATE,
     AGENT_C_EVIDENCE_TEMPLATE,
+    AGENT_C_FINAL_TEMPLATE,
 )
+from app.core.schemas import (
+    ViolationCaseStage1Batch,
+)
+from app.db.chroma_manager import chroma_db
+from app.services.utils import normalize_category
 
 
-# ==========================================
-# Agent C (合规审查官)
-# ==========================================
 class AgentCompliance:
+    """
+    Agent C（审核 + 证据链两阶段）：
+    1. 第一阶段：对主贴/评论一次性做审核判定（违规与否、类别、风险）
+    2. 第二阶段：仅对已判违规项补充法规依据与证据链
+    3. 保留类别为空时的一次 LLM 类别复核与法规检索链路
+    """
+
+    LAW_MATCH_WORKERS = 4
+    DISPOSAL_OPTIONS = [
+        "限制/更改/屏蔽/删除相关内容的展示",
+        "撤销/删除/禁止修改账号认证、个人信息",
+        "禁言、禁点赞、禁被关注、禁发送及接收私信",
+        "扣除信用积分、中止或扣除广告共享收益、暂停/终止服务、注销账号",
+        "向有关监管部门或国家机关报告",
+        "其他合理措施",
+    ]
+
     def __init__(self):
-        # 初始化大脑
-        self.llm = ChatOpenAI(
-            model=settings.LLM_MODEL,  # 例如 "glm-4-flash"
-            openai_api_key=settings.ZHIPU_API_KEY,
-            openai_api_base=settings.LLM_BASE_URL,  # 这里的 URL 必须是智谱的地址
+        self.audit_llm = get_main_llm(
             temperature=0.1,
-            request_timeout=180,  #  增加超时时间
-            max_retries=3,
+            request_timeout=180,
+            max_retries=2,
         )
-        # 批量模式解析器 (已弃用，改用 with_structured_output)
-        # self.batch_parser = JsonOutputParser(pydantic_object=BatchComplianceResult)
 
-        # Batch+RAG 证据链解析器 (已弃用，改用 with_structured_output)
-        # self.evidence_parser = JsonOutputParser(pydantic_object=ComplianceEvidenceReport)
-
-        # 完整的标签列表 (保留用于单条模式的 RAG 检索或参考)
+        logger.info(" [Agent C] 已启用两阶段模式：先审核，再补法规与证据链。")
         self.valid_categories = [
             "时政有害-国家安全",
             "时政有害-极端主义",
@@ -101,403 +101,1109 @@ class AgentCompliance:
             "垃圾行为-黑产交易",
         ]
 
-    # =======================================================
-    # 输入预处理：降低 LLM 内容安全过滤的触发概率
-    # =======================================================
     @staticmethod
-    def _sanitize_for_llm(text: str) -> str:
-        """
-        对送入 LLM 的文本做增强脱敏（基于 Prompt Engineering 反过滤技巧）：
-        - 用 * 遮盖极端敏感词的中间部分（保留首尾以保证可审性）
-        - 移除连续重复的脏话/辱骂（降低 toxicity 浓度）
-        - 截断过长文本避免触发 provider 的长上下文敏感检测
-        - 对特定敏感短语做整体替换（降低语义级别的触发概率）
-        不会改变语义判断——审查的是模式而非原文。
-        """
-        if not text:
+    def _is_content_filter(e: Exception) -> bool:
+        msg = str(e).lower()
+        return any(
+            kw in msg
+            for kw in [
+                "content_filter",
+                "content filter",
+                "content management",
+                "sensitive",
+                "refused",
+                "refusal",
+                "harmful",
+                "responsibleaipolicy",
+                "safety",
+            ]
+        )
+
+    @staticmethod
+    def _is_timeout(e: Exception) -> bool:
+        msg = str(e).lower()
+        return any(kw in msg for kw in ["timed out", "timeout", "read timeout"])
+
+    @staticmethod
+    def _is_retryable_evidence_error(e: Exception) -> bool:
+        """证据链增强的轻量重试判定：仅对瞬时异常重试一次。"""
+        msg = str(e).lower()
+
+        # 内容策略与提示词/结构化输出错误不做重试，避免无效调用。
+        if AgentCompliance._is_content_filter(e):
+            return False
+        non_retryable_keywords = [
+            "missing variables",
+            "invalid_prompt_input",
+            "validationerror",
+            "pydantic",
+            "output parser",
+            "jsondecodeerror",
+            "schema",
+        ]
+        if any(kw in msg for kw in non_retryable_keywords):
+            return False
+
+        if AgentCompliance._is_timeout(e):
+            return True
+
+        retryable_keywords = [
+            "rate limit",
+            "too many requests",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "service unavailable",
+            "connection",
+            "temporarily unavailable",
+            "internal server error",
+        ]
+        return any(kw in msg for kw in retryable_keywords)
+
+    @staticmethod
+    def _clean_text(text: Any) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        return " ".join(value.split())
+
+    @staticmethod
+    def _is_stage1_json_parse_error(e: Exception) -> bool:
+        """判断是否为阶段1结构化JSON解析失败（如 trailing characters）。"""
+        msg = str(e).lower()
+        return "validation error for violationcasestage1batch" in msg and (
+            "json_invalid" in msg
+            or "invalid json" in msg
+            or "trailing characters" in msg
+        )
+
+    @staticmethod
+    def _extract_first_json_object(raw_text: str) -> str:
+        """从模型原始文本中提取首个完整JSON对象，容忍前后杂质文本。"""
+        if not raw_text:
+            return ""
+
+        text = str(raw_text)
+        start = text.find("{")
+        if start < 0:
+            return ""
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+
+        return ""
+
+    @staticmethod
+    def _message_content_to_text(content: Any) -> str:
+        """兼容不同provider返回形态，将消息content统一为纯文本。"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join([p for p in parts if p])
+        return str(content or "")
+
+    def _build_candidate_pool(
+        self, post_packet: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        pool: List[Dict[str, Any]] = []
+        post_content = self._clean_text(post_packet.get("content"))
+        if post_content:
+            pool.append(
+                {
+                    "index": -1,
+                    "source_type": "post",
+                    "source_id": str(post_packet.get("note_id") or ""),
+                    "content": post_content,
+                }
+            )
+
+        for idx, item in enumerate(post_packet.get("audit_comment_items") or []):
+            content = self._clean_text(item.get("content"))
+            if not content:
+                continue
+            pool.append(
+                {
+                    "index": idx,
+                    "source_type": "comment",
+                    "source_id": str(item.get("comment_id") or ""),
+                    "db_id": item.get("db_id", ""),
+                    "content": content,
+                    "comment_like_count": item.get("comment_like_count", "0"),
+                    "create_date_time": item.get("create_date_time", ""),
+                }
+            )
+        return pool
+
+    def _canonicalize_category(self, raw_category: str, fallback: str = "") -> str:
+        value = normalize_category(raw_category or "")
+        fallback_value = normalize_category(fallback or "")
+
+        if value in self.valid_categories:
+            return value
+
+        if fallback_value in self.valid_categories:
+            return fallback_value
+
+        # 不做关键词映射与模糊兜底，避免人工规则覆盖模型判定。
+        return ""
+
+    def _passes_violation_floor(self, case: Dict[str, Any]) -> bool:
+        # 仅做最小结构校验：是否判违规、类别是否在白名单、是否有可定位文本。
+        if not bool(case.get("is_violation", True)):
+            return False
+
+        category = self._canonicalize_category(case.get("category", ""))
+        quote = self._clean_text(case.get("quote"))
+        content = self._clean_text(case.get("content"))
+
+        if not category:
+            return False
+
+        return bool(quote or content)
+
+    @staticmethod
+    def _chunk(items: List[Dict[str, Any]], size: int) -> List[List[Dict[str, Any]]]:
+        return [items[i : i + size] for i in range(0, len(items), size)]
+
+    @staticmethod
+    def _invoke_finalize_chain(
+        llm,
+        event_name: str,
+        source_keyword: str,
+        post_content: str,
+        candidate_items: List[Dict[str, Any]],
+        categories: List[str],
+    ):
+        chain = ChatPromptTemplate.from_template(
+            AGENT_C_FINAL_TEMPLATE
+        ) | llm.with_structured_output(ViolationCaseStage1Batch)
+        return chain.invoke(
+            {
+                "event_name": event_name,
+                "source_keyword": source_keyword,
+                "categories": ", ".join(categories),
+                "post_content": post_content,
+                "candidate_items": json.dumps(candidate_items, ensure_ascii=False),
+            }
+        )
+
+    @staticmethod
+    def _invoke_final_chain_lenient(
+        llm,
+        event_name: str,
+        source_keyword: str,
+        post_content: str,
+        candidate_items: List[Dict[str, Any]],
+        categories: List[str],
+    ) -> ViolationCaseStage1Batch:
+        """结构化解析失败时的宽容回退：同提示词二次调用并提取首个JSON对象。"""
+        chain = ChatPromptTemplate.from_template(AGENT_C_FINAL_TEMPLATE) | llm
+        raw_message = chain.invoke(
+            {
+                "event_name": event_name,
+                "source_keyword": source_keyword,
+                "categories": ", ".join(categories),
+                "post_content": post_content,
+                "candidate_items": json.dumps(candidate_items, ensure_ascii=False),
+            }
+        )
+
+        raw_text = AgentCompliance._message_content_to_text(
+            getattr(raw_message, "content", raw_message)
+        )
+        json_text = AgentCompliance._extract_first_json_object(raw_text)
+        if not json_text:
+            raise ValueError("阶段1宽容解析失败：未从模型输出中提取到JSON对象")
+        return ViolationCaseStage1Batch.model_validate_json(json_text)
+
+    @staticmethod
+    def _invoke_final_chain(
+        llm,
+        event_name: str,
+        source_keyword: str,
+        post_content: str,
+        candidate_items: List[Dict[str, Any]],
+        categories: List[str],
+    ):
+        """兼容旧调用口径：统一走第一阶段审核链。"""
+        return AgentCompliance._invoke_finalize_chain(
+            llm=llm,
+            event_name=event_name,
+            source_keyword=source_keyword,
+            post_content=post_content,
+            candidate_items=candidate_items,
+            categories=categories,
+        )
+
+    def _default_stage1_case(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        content = self._clean_text(item.get("content", ""))
+        return {
+            "index": int(item.get("index", -1)),
+            "source_type": item.get("source_type") or "comment",
+            "source_id": str(item.get("source_id") or ""),
+            "content": content,
+            "quote": content[:120],
+            "category": "",
+            "reasoning": "阶段1未返回有效结果，按不违规处理。",
+            "is_violation": False,
+        }
+
+    def _finalize_batch(
+        self,
+        post_content: str,
+        candidate_items: List[Dict[str, Any]],
+        batch_size: int,
+        event_name: str = "",
+        source_keyword: str = "",
+        llm=None,
+        llm_name: str = "strong",
+        allow_backup: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        blocked_count = 0
+        if not candidate_items:
+            return [], blocked_count
+
+        llm = llm or self.audit_llm
+        try:
+            result = None
+            stage1_error: Optional[Exception] = None
+            try:
+                result = self._invoke_final_chain(
+                    llm=llm,
+                    event_name=event_name,
+                    source_keyword=source_keyword,
+                    post_content=post_content,
+                    candidate_items=candidate_items,
+                    categories=self.valid_categories,
+                )
+            except TypeError:
+                result = self._invoke_final_chain(
+                    llm,
+                    post_content,
+                    candidate_items,
+                )
+
+            except Exception as e:
+                stage1_error = e
+
+            if (
+                result is None
+                and stage1_error
+                and self._is_stage1_json_parse_error(stage1_error)
+            ):
+                logger.warning(
+                    " [Agent C] 阶段1结构化解析失败，触发宽容JSON回退解析一次。"
+                )
+                try:
+                    result = self._invoke_final_chain_lenient(
+                        llm=llm,
+                        event_name=event_name,
+                        source_keyword=source_keyword,
+                        post_content=post_content,
+                        candidate_items=candidate_items,
+                        categories=self.valid_categories,
+                    )
+                except Exception as lenient_error:
+                    stage1_error = lenient_error
+
+            if result is None:
+                raise stage1_error or RuntimeError("阶段1审核未返回结果")
+
+            candidate_by_index: Dict[int, Dict[str, Any]] = {}
+            for item in candidate_items:
+                try:
+                    idx = int(item.get("index", -1))
+                except Exception:
+                    continue
+                candidate_by_index[idx] = item
+
+            parsed_by_index: Dict[int, Dict[str, Any]] = {}
+            for case in result.cases:
+                dumped = (
+                    case.model_dump() if hasattr(case, "model_dump") else dict(case)
+                )
+                try:
+                    idx = int(dumped.get("index", -1))
+                except Exception:
+                    continue
+
+                base = candidate_by_index.get(idx)
+                if not base:
+                    continue
+
+                quote = self._clean_text(dumped.get("quote", ""))
+                content = self._clean_text(base.get("content", ""))
+                merged = {
+                    "index": idx,
+                    "source_type": base.get("source_type") or "comment",
+                    "source_id": str(base.get("source_id") or ""),
+                    "content": content,
+                    "quote": quote or content[:120],
+                    "category": self._canonicalize_category(
+                        dumped.get("category", ""),
+                        fallback=base.get("candidate_category", ""),
+                    ),
+                    "reasoning": self._clean_text(dumped.get("reasoning", "")),
+                    "is_violation": bool(dumped.get("is_violation", False)),
+                }
+
+                if not merged["is_violation"]:
+                    merged["category"] = ""
+                parsed_by_index[idx] = merged
+
+            cases: List[Dict[str, Any]] = []
+            for item in candidate_items:
+                try:
+                    idx = int(item.get("index", -1))
+                except Exception:
+                    continue
+                cases.append(
+                    parsed_by_index.get(idx) or self._default_stage1_case(item)
+                )
+            return cases, blocked_count
+        except Exception as e:
+            is_filtered = self._is_content_filter(e)
+            is_timeout = self._is_timeout(e)
+
+            if (is_filtered or is_timeout) and batch_size > 1:
+                cases: List[Dict[str, Any]] = []
+                for sub_batch in self._chunk(candidate_items, 1):
+                    sub_cases, sub_blocked = self._finalize_batch(
+                        post_content=post_content,
+                        event_name=event_name,
+                        source_keyword=source_keyword,
+                        candidate_items=sub_batch,
+                        batch_size=1,
+                        llm=llm,
+                        llm_name=llm_name,
+                        allow_backup=allow_backup,
+                    )
+                    cases.extend(sub_cases)
+                    blocked_count += sub_blocked
+                return cases, blocked_count
+
+            blocked_count += len(candidate_items)
+            logger.warning(
+                f" [Agent C] 阶段1审核批次失败，已跳过 {len(candidate_items)} 条: {e}"
+            )
+            return [], blocked_count
+
+    def finalize_candidates(
+        self,
+        post_content: str,
+        candidate_pool: List[Dict[str, Any]],
+        suspects: List[Dict[str, Any]],
+        event_name: str = "",
+        source_keyword: str = "",
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        by_index = {item["index"]: item for item in candidate_pool}
+        blocked_count = 0
+        final_cases: List[Dict[str, Any]] = []
+
+        batches: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for suspect in suspects:
+            base = by_index.get(suspect.get("index"))
+            if not base:
+                continue
+            current.append(
+                {
+                    "index": base["index"],
+                    "source_type": base["source_type"],
+                    "source_id": base["source_id"],
+                    "content": base["content"],
+                    "candidate_category": suspect.get("category", ""),
+                    "reason_brief": suspect.get("reason_brief", ""),
+                }
+            )
+            if len(current) >= 5:
+                batches.append(current)
+                current = []
+        if current:
+            batches.append(current)
+
+        for batch in batches:
+            batch_cases, batch_blocked = self._finalize_batch(
+                event_name=event_name,
+                source_keyword=source_keyword,
+                post_content=post_content,
+                candidate_items=batch,
+                batch_size=len(batch),
+            )
+            final_cases.extend(batch_cases)
+            blocked_count += batch_blocked
+        return final_cases, blocked_count
+
+    @staticmethod
+    def _risk_value(risk_level: str) -> int:
+        return {"Low": 1, "Medium": 2, "High": 3}.get(risk_level or "Low", 1)
+
+    @staticmethod
+    def _normalize_risk_level(value: str) -> str:
+        text = str(value or "").strip()
+        return text if text in {"High", "Medium", "Low"} else ""
+
+    def _derive_risk_level(self, case: Dict[str, Any], law_info: Dict[str, Any]) -> str:
+        matched = (law_info or {}).get("matched_laws") or []
+        levels: List[str] = []
+        for law in matched:
+            if not isinstance(law, dict):
+                continue
+            level = self._normalize_risk_level(
+                law.get("risk_level") or law.get("risk") or ""
+            )
+            if level:
+                levels.append(level)
+
+        if levels:
+            levels.sort(key=self._risk_value, reverse=True)
+            return levels[0]
+
+        fallback = self._normalize_risk_level(case.get("risk_level", ""))
+        return fallback or "Low"
+
+    def _normalize_disposal_suggestion(
+        self, suggestion: str, risk_level: str, is_violation: bool
+    ) -> str:
+        text = self._clean_text(suggestion)
+        if not is_violation:
+            return self.DISPOSAL_OPTIONS[5]
+
+        if text in self.DISPOSAL_OPTIONS:
             return text
 
-        # 1. 过度重复的辱骂行/脏话行（≥3次连续相同句）折叠
-        text = re.sub(r"((.{4,50})\n?)\1{2,}", r"\1（重复内容已折叠）", text)
+        if any(k in text for k in ["认证", "实名", "冒名", "个人信息", "资料"]):
+            return self.DISPOSAL_OPTIONS[1]
+        if any(k in text for k in ["禁言", "禁赞", "禁点赞", "禁被关注", "私信"]):
+            return self.DISPOSAL_OPTIONS[2]
+        if any(
+            k in text
+            for k in ["积分", "信用", "收益", "暂停服务", "终止服务", "注销", "封号"]
+        ):
+            return self.DISPOSAL_OPTIONS[3]
+        if any(k in text for k in ["公安", "监管", "国家机关", "报案", "移交", "举报"]):
+            return self.DISPOSAL_OPTIONS[4]
+        if any(k in text for k in ["删除", "屏蔽", "下架", "隐藏", "限制", "更改"]):
+            return self.DISPOSAL_OPTIONS[0]
 
-        # 2. 扩展敏感词列表（基于 Azure/OpenAI Content Filter 的四大类别）
-        #    保留首尾字符以供分类，中间用 * 遮盖
-        _MASK_WORDS = [
-            # 暴力类
-            "自杀",
-            "杀人",
-            "割腕",
-            "跳楼",
-            "杀死",
-            "弑杀",
-            "杀害",
-            "砍死",
-            "捅死",
-            "炸弹",
-            "枪支",
-            "爆炸",
-            "枪杀",
-            "持枪",
-            "炸死",
-            "毒杀",
-            # 色情类
-            "强奸",
-            "轮奸",
-            "裸体",
-            "性交",
-            "性侵",
-            "猥亵",
-            "淫秽",
-            "色情",
-            "嫖娼",
-            "卖淫",
-            "约炮",
-            "做爱",
-            "操逼",
-            "鸡巴",
-            "阴茎",
-            "阴道",
-            # 毒品/违禁品
-            "贩毒",
-            "吸毒",
-            "毒品",
-            "海洛因",
-            "冰毒",
-            "大麻",
-            # 涉未成年
-            "幼女",
-            "萝莉",
-            "恋童",
-            "未成年",
-            "童年",
-            # 仇恨/歧视
-            "杂种",
-            "畜生",
-            "贱人",
-            "婊子",
-            "狗日",
-        ]
-        for w in _MASK_WORDS:
-            if len(w) >= 2:
-                masked = w[0] + "*" * (len(w) - 2) + w[-1]
-                text = text.replace(w, masked)
+        if (risk_level or "").strip() == "High":
+            return self.DISPOSAL_OPTIONS[3]
+        return self.DISPOSAL_OPTIONS[5]
 
-        # 3. 敏感短语整体替换为抽象描述（降低语义级触发）
-        _PHRASE_REPLACEMENTS = [
-            (r"强奸幼女|强奸未成年|性侵幼女|性侵未成年", "[涉未成年人侵害案]"),
-            (r"杀人分尸|肢解尸体|碎尸", "[涉极端暴力案]"),
-            (r"人口贩卖|贩卖人口|拐卖儿童", "[涉人口贩运案]"),
-            (r"恐怖袭击|恐怖分子", "[涉恐案]"),
-            (r"色情引流|招嫖|约炮", "[涉色情引流]"),
-        ]
-        for pattern, replacement in _PHRASE_REPLACEMENTS:
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    class _EvidenceEnhanceResult(BaseModel):
+        reasoning: str = Field(default="", description="违规理由精炼表述")
+        disposal_suggestion: str = Field(default="", description="处置建议（六选一）")
+        evidence_chain: List[str] = Field(
+            default_factory=list, description="证据链要点"
+        )
 
-        # 4. 截断过长文本（单条超过 2000 字符时截断，避免长上下文敏感聚集）
-        if len(text) > 2000:
-            text = text[:2000] + "...（因内容过长已截断）"
-
-        return text
-
-    # =======================================================
-    #  新增：Batch Audit (一次性审查 主贴 + 列表评论)
-    # =======================================================
-    def batch_audit(
+    def _invoke_evidence_chain(
         self,
         post_content: str,
-        comments_text: str,
-        media_context: str = "",
-        note_id: str = "Unknown_ID",
-    ) -> BatchComplianceResult:
-        """
-        执行批量审查流程
-        :param post_content: 主贴正文
-        :param comments_text: 格式化好的评论列表字符串
-        :param media_context: 媒体链接上下文
-        :param note_id: 帖子真实 ID (用于 Prompt 上下文)
-        :return: BatchComplianceResult 对象
-        """
-        logger.info(f" [Agent C] 正在进行批量审查 (Batch Audit) ID: {note_id}...")
+        media_context: str,
+        violated_items_json: str,
+        laws_json: str,
+    ) -> "AgentCompliance._EvidenceEnhanceResult":
+        chain = ChatPromptTemplate.from_template(
+            AGENT_C_EVIDENCE_TEMPLATE
+        ) | self.audit_llm.with_structured_output(self._EvidenceEnhanceResult)
+        return chain.invoke(
+            {
+                "post_content": post_content,
+                "media_context": media_context,
+                "violated_items_json": violated_items_json,
+                "laws_json": laws_json,
+            }
+        )
 
-        # 1. 组装 Prompt
-        #  升级：使用 with_structured_output，不再需要 format_instructions
-        structured_llm = self.llm.with_structured_output(BatchComplianceResult)
-        prompt = ChatPromptTemplate.from_template(AGENT_C_BATCH_TEMPLATE)
+    class _CategoryRecheckResult(BaseModel):
+        category: str = Field(
+            default="", description="纠偏后的白名单类别，无法确定则为空"
+        )
 
-        # 2. 构造链
-        chain = prompt | structured_llm
+    def _repair_category_once_by_llm(
+        self, case: Dict[str, Any], current_category: str
+    ) -> str:
+        quote = self._clean_text(case.get("quote"))
+        reasoning = self._clean_text(case.get("reasoning"))
+        if not quote and not reasoning:
+            return ""
+
+        llm = self.audit_llm
+        if not getattr(llm, "openai_api_key", None):
+            return ""
 
         try:
-            # 3. 调用 LLM（输入预处理降低过滤概率）
-            res_obj = chain.invoke(
+            chain = ChatPromptTemplate.from_template(
+                AGENT_C_CATEGORY_RECHECK_TEMPLATE
+            ) | llm.with_structured_output(self._CategoryRecheckResult)
+            result = chain.invoke(
                 {
+                    "current_category": current_category or "",
                     "categories": ", ".join(self.valid_categories),
-                    "post_id": note_id,
-                    "post_content": self._sanitize_for_llm(post_content),
-                    "media_context": media_context,
-                    "comments_text": self._sanitize_for_llm(comments_text),
-                    "improvement_hint": "",  # 首次审查无改进建议
+                    "quote": quote,
+                    "reasoning": reasoning,
                 }
             )
-
-            # 4. 转换为 Pydantic 对象返回 (with_structured_output 直接返回对象)
-            return res_obj
-
+            repaired = self._canonicalize_category(getattr(result, "category", ""))
+            if (
+                repaired
+                and repaired in self.valid_categories
+                and repaired != current_category
+            ):
+                return repaired
         except Exception as e:
-            err_msg = str(e).lower()
-            is_filter = any(
-                kw in err_msg
-                for kw in [
-                    "content_filter",
-                    "content filter",
-                    "content management",
-                    "sensitive",
-                    "refused",
-                    "refusal",
-                    "harmful",
-                    "responsibleaipolicy",
-                    "safety",
-                ]
+            logger.warning(f" [Agent C] 类别复核失败，继续后续检索路径: {e}")
+        return ""
+
+    def _match_laws_for_case(self, case: Dict[str, Any]) -> Dict[str, Any]:
+        canonical_category = self._canonicalize_category(case.get("category", ""))
+        category_recheck_note = ""
+
+        query = "；".join(
+            [
+                canonical_category or normalize_category(case.get("category", "")),
+                case.get("quote", ""),
+                case.get("reasoning", ""),
+            ]
+        ).strip("；")
+
+        docs: List[Any] = []
+
+        def _search_by_category(category: str) -> List[Any]:
+            if not category:
+                return []
+            matched = chroma_db.search_related_laws(
+                query=query,
+                top_k=3,
+                category_filter=category,
+                use_hyde=False,
             )
-            if is_filter:
-                logger.warning(
-                    f" [Agent C] 内容安全过滤拦截 (ID: {note_id})，尝试保守降级重试..."
-                )
-
-                # 尝试更保守的降级策略：去除引用/只保留前若干条评论并再次调用
-                try:
-                    # 去掉显式引用/引号内容，保留首尾词
-                    safe_post = re.sub(r'["""][^"""]*["""]', "", post_content)
-                    safe_post = re.sub(r"['''][^''']*[''']", "", safe_post)
-                    # 仅保留前 10 条评论以降低敏感度
-                    safe_comments_lines = (comments_text or "").splitlines()[:10]
-                    safe_comments = "\n".join(safe_comments_lines)
-
-                    res_obj = chain.invoke(
-                        {
-                            "categories": ", ".join(self.valid_categories),
-                            "post_id": note_id,
-                            "post_content": self._sanitize_for_llm(safe_post),
-                            "media_context": media_context,
-                            "comments_text": self._sanitize_for_llm(safe_comments),
-                            "improvement_hint": "(因内容安全策略触发，使用高度脱敏输入重试)",
-                        }
-                    )
-                    return res_obj
-                except Exception as e2:
-                    logger.info(f" [Agent C] 帖子 {note_id} 审查通过（简化模式）")
-                    # 降级为安全：内容无法深度分析时默认合规
-                    return BatchComplianceResult(
-                        is_post_violated=False, violated_comments=[]
-                    )
-            else:
-                logger.error(f" [Agent C] Batch Audit Error (ID: {note_id}): {e}")
-                return BatchComplianceResult(
-                    is_post_violated=False, violated_comments=[]
-                )
-
-    def batch_audit_with_rag(
-        self,
-        post_content: str,
-        comments_text: str,
-        media_context: str = "",
-        note_id: str = "Unknown_ID",
-        top_k_per_category: int = 2,
-    ) -> Dict[str, Any]:
-        """Batch 审查 + RAG 检索 + 证据链生成（用于写回 Mongo）。
-
-        返回值是 dict，包含：
-        - batch_result: BatchComplianceResult 的 model_dump
-        - matched_laws: List[LawReference-dict]
-        - evidence_report: ComplianceEvidenceReport 的 dict（若无违规则为空）
-        """
-
-        batch_res = self.batch_audit(
-            post_content=post_content,
-            comments_text=comments_text,
-            media_context=media_context,
-            note_id=note_id,
-        )
-
-        batch_dict = (
-            batch_res.model_dump()
-            if hasattr(batch_res, "model_dump")
-            else dict(batch_res)
-        )
-
-        # 简化模式下直接返回安全结果
-        if getattr(batch_res, "_content_filter_blocked", False):
-            logger.info(f" [Agent C] 帖子 {note_id} 审查通过（简化模式）")
-            return {
-                "batch_result": {"is_post_violated": False, "violated_comments": []},
-                "matched_laws": [],
-                "evidence_report": {},
-            }
-
-        violated_items = batch_dict.get("violated_comments") or []
-
-        # 无违规：直接返回
-        if not (batch_dict.get("is_post_violated") or violated_items):
-            return {
-                "batch_result": batch_dict,
-                "matched_laws": [],
-                "evidence_report": {},
-            }
-
-        # 1) 收集违规标签
-        categories = []
-        for it in violated_items:
-            cat = (it or {}).get("category")
-            if cat and cat not in categories:
-                categories.append(cat)
-
-        # 2) Chroma 检索（按标签过滤，保证命中条款可解释）
-        #  升级：同时回填 risk_level 到 violated_items
-        matched_laws: List[Dict[str, Any]] = []
-
-        # 建立 category -> risk_level 的映射缓存
-        cat_risk_map = {}
-
-        for cat in categories:
-            # 构建丰富检索 query：收集该类别下所有违规项的 quote+reasoning
-            # HyDE 会用这些内容生成假设性法规条款，再用其 embedding 检索
-            query_parts = [cat]
-            seen_quotes = set()
-            for it in violated_items:
-                if (it or {}).get("category") != cat:
-                    continue
-                quote = (it.get("quote") or "").strip()
-                reasoning = (it.get("reasoning") or "").strip()
-                # 去重：相同 quote 不重复加入
-                if quote and quote not in seen_quotes:
-                    seen_quotes.add(quote)
-                    query_parts.append(quote[:80])
-                if reasoning:
-                    query_parts.append(reasoning[:80])
-            # 截断总长度避免 HyDE prompt 过长
-            hyde_query = "；".join(query_parts)[:500]
-
-            try:
-                docs = chroma_db.search_related_laws(
-                    query=hyde_query,
-                    top_k=top_k_per_category,
-                    category_filter=cat,
+            if not matched:
+                matched = chroma_db.search_related_laws(
+                    query=query,
+                    top_k=3,
+                    category_filter=category,
                     use_hyde=True,
                 )
-            except Exception as e:
-                logger.warning(f" [Agent C] RAG 检索失败 (category={cat}): {e}")
-                docs = []
+            return matched
 
-            for d in docs or []:
-                meta = getattr(d, "metadata", {}) or {}
-                risk = meta.get("risk_level", meta.get("risk", "Low"))
+        if canonical_category:
+            docs = _search_by_category(canonical_category)
 
-                # 记录映射
-                if cat not in cat_risk_map:
-                    cat_risk_map[cat] = risk
-                elif risk == "High":  # 如果有 High，优先覆盖
-                    cat_risk_map[cat] = "High"
+        if not docs:
+            repaired_category = self._repair_category_once_by_llm(
+                case, canonical_category
+            )
+            if repaired_category:
+                docs = _search_by_category(repaired_category)
+                if docs:
+                    category_recheck_note = f"类别复核后改为“{repaired_category}”。"
+                    canonical_category = repaired_category
 
-                matched_laws.append(
-                    {
-                        "category": meta.get("category", cat),
-                        "article": meta.get("article", "未知"),
-                        "risk_level": risk,
-                        "rule": getattr(d, "page_content", "") or "",
-                        # 优先取 metadata.full_desc（init_weibo_rules 写入），否则降级到 behavior，最后用 page_content
-                        "full_desc": meta.get("full_desc", ""),
-                    }
-                )
+        if not docs:
+            docs = chroma_db.search_related_laws(
+                query=query,
+                top_k=3,
+                category_filter=None,
+                use_hyde=False,
+            )
+        if not docs:
+            docs = chroma_db.search_related_laws(
+                query=query,
+                top_k=3,
+                category_filter=None,
+                use_hyde=True,
+            )
+        if not docs and canonical_category:
+            docs = chroma_db.search_related_laws(
+                query=canonical_category,
+                top_k=3,
+                category_filter=None,
+                use_hyde=False,
+            )
 
-        #  回填 risk_level 到 violated_items
-        max_risk_val = 0  # 0:Low, 1:Medium, 2:High
-        risk_val_map = {"Low": 0, "Medium": 1, "High": 2, "None": 0}
-
-        for item in violated_items:
-            cat = item.get("category")
-            # 从 RAG 结果中查找 risk，找不到默认 Low
-            found_risk = cat_risk_map.get(cat, "Low")
-            item["risk_level"] = found_risk
-
-            # 计算整体风险
-            current_val = risk_val_map.get(found_risk, 0)
-            if current_val > max_risk_val:
-                max_risk_val = current_val
-
-        # 回填整体风险
-        final_overall_risk = "Low"
-        if max_risk_val == 1:
-            final_overall_risk = "Medium"
-        if max_risk_val == 2:
-            final_overall_risk = "High"
-        batch_dict["overall_risk_level"] = final_overall_risk
-
-        # # 限制条款数量，防止 token 膨胀
-        # if len(matched_laws) > 12:
-        #     matched_laws = matched_laws[:12]
-
-        # 3) 生成证据链（结构化 JSON）
-        try:
-            structured_llm = self.llm.with_structured_output(ComplianceEvidenceReport)
-            prompt = ChatPromptTemplate.from_template(AGENT_C_EVIDENCE_TEMPLATE)
-            chain = prompt | structured_llm
-
-            evidence_obj = chain.invoke(
+        matched_laws: List[Dict[str, Any]] = []
+        for doc in docs or []:
+            meta = getattr(doc, "metadata", {}) or {}
+            matched_laws.append(
                 {
-                    "post_content": post_content,
-                    "media_context": media_context,
-                    "violated_items_json": json.dumps(
-                        violated_items, ensure_ascii=False
-                    ),
-                    "laws_json": json.dumps(matched_laws, ensure_ascii=False),
+                    "category": meta.get("category", canonical_category),
+                    "article": meta.get("article", "未知"),
+                    "risk_level": meta.get("risk_level", meta.get("risk", "Low")),
+                    "rule": getattr(doc, "page_content", "") or "",
+                    "full_desc": meta.get("full_desc", ""),
                 }
             )
-            evidence_report = (
-                evidence_obj.model_dump()
-                if hasattr(evidence_obj, "model_dump")
-                else dict(evidence_obj)
+
+        if not matched_laws:
+            return {
+                "matched_laws": [],
+                "primary_law": "",
+                "law_reason": "未检索到可核验法规条款，按不违规放行。",
+            }
+
+        primary_law = matched_laws[0]
+        if primary_law:
+            desc = primary_law.get("full_desc") or primary_law.get("rule") or ""
+            primary_law_text = (
+                f"{primary_law.get('article', '未知条款')} {desc}".strip()
             )
-        except Exception as e:
-            logger.warning(f" [Agent C] 证据链生成失败 (ID: {note_id}): {e}")
-            evidence_report = {}
+            law_reason = (
+                f"该内容被认定为“{case.get('category','')}”，与 {primary_law.get('article','未知条款')} "
+                f"中关于“{desc[:40] or case.get('category','相关规则')}”的规定最接近。"
+            )
+            if category_recheck_note:
+                law_reason = f"{category_recheck_note}{law_reason}"
+        return {
+            "matched_laws": matched_laws,
+            "primary_law": primary_law_text,
+            "law_reason": law_reason,
+        }
 
-        # ======================================================================
-        #  Step 4: 兜底回填逻辑 (修复版)
-        # ======================================================================
-        # 严格映射 LLM 生成的 LawReference 字段，不使用硬编码默认值
-        if not matched_laws and evidence_report:
-            cited_list = evidence_report.get("cited_laws") or []
+    @staticmethod
+    def _build_case_evidence_chain(
+        case: Dict[str, Any], law_info: Dict[str, Any]
+    ) -> List[str]:
+        chain: List[str] = []
+        quote = case.get("quote", "").strip()
+        reasoning = case.get("reasoning", "").strip()
+        primary_law = (law_info or {}).get("primary_law", "").strip()
+        law_reason = (law_info or {}).get("law_reason", "").strip()
 
-            for item in cited_list:
-                # item 已经是字典 (来自 evidence_report.model_dump())
+        if quote:
+            chain.append(f"违规摘录：{quote}")
+        if reasoning:
+            chain.append(f"判定要点：{reasoning}")
+        if primary_law:
+            chain.append(f"主要依据：{primary_law}")
+        if law_reason:
+            chain.append(f"匹配说明：{law_reason}")
+        return chain
 
-                fallback_law = {
-                    # 1. 基础字段直接映射 (LLM 输出什么就用什么)
-                    "category": item.get("category"),
-                    "article": item.get("article"),
-                    "risk_level": item.get("risk_level"),
-                    # 2. 内容字段映射
-                    # Chroma 结果里叫 "rule" (page_content)，Schema 里也叫 "rule"
-                    "rule": item.get("rule"),
-                    # 3. 关键字段适配
-                    # agent_report.py 的 _assemble_markdown 方法读取的是 "full_desc"
-                    # LawReference Schema 里没有 full_desc，只有 rule
-                    # 所以必须把 rule 的内容填给 full_desc，否则报告表格里这一栏会是空白或"-"
-                    "full_desc": item.get("rule"),
+    def repair_existing_violation_info(
+        self, violation_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """修复历史审核结果，避免旧口径误判持续复用。"""
+        info = dict(violation_info or {})
+
+        post_case_raw = info.get("post_case") or None
+        comment_cases_raw = info.get("comment_cases") or []
+
+        normalized_cases: List[Dict[str, Any]] = []
+
+        def _normalize_case(
+            case: Dict[str, Any], source_type: str, default_index: int
+        ) -> Optional[Dict[str, Any]]:
+            if not isinstance(case, dict):
+                return None
+
+            normalized = dict(case)
+            normalized["source_type"] = normalized.get("source_type") or source_type
+            normalized["index"] = normalized.get("index", default_index)
+            normalized["is_violation"] = bool(normalized.get("is_violation", True))
+            normalized["category"] = self._canonicalize_category(
+                normalized.get("category", "")
+            )
+
+            if not normalized.get("is_violation"):
+                return None
+            if not normalized.get("category"):
+                return None
+            if not self._passes_violation_floor(normalized):
+                return None
+
+            needs_law_patch = not normalized.get("primary_law") or not (
+                normalized.get("matched_laws") or []
+            )
+
+            law_info = (
+                self._match_laws_for_case(normalized)
+                if needs_law_patch
+                else {
+                    "matched_laws": normalized.get("matched_laws") or [],
+                    "primary_law": normalized.get("primary_law", ""),
+                    "law_reason": normalized.get("law_reason", ""),
                 }
-                matched_laws.append(fallback_law)
+            )
 
-            if matched_laws:
-                logger.info(
-                    f" [Agent C] RAG为空，已回填 {len(matched_laws)} 条 LLM 生成的条款。"
-                )
+            merged = {**normalized, **law_info}
+            if not (merged.get("matched_laws") or []):
+                return None
+            merged["risk_level"] = self._derive_risk_level(merged, law_info)
+            merged["evidence_chain"] = self._build_case_evidence_chain(merged, law_info)
+            return merged
+
+        if post_case_raw:
+            repaired_post = _normalize_case(post_case_raw, "post", -1)
+            if repaired_post:
+                normalized_cases.append(repaired_post)
+
+        for raw_case in comment_cases_raw:
+            repaired_comment = _normalize_case(
+                raw_case,
+                "comment",
+                raw_case.get("index", -1) if isinstance(raw_case, dict) else -1,
+            )
+            if repaired_comment:
+                normalized_cases.append(repaired_comment)
+
+        post_case = None
+        comment_cases: List[Dict[str, Any]] = []
+        matched_laws_all: List[Dict[str, Any]] = []
+        categories: List[str] = []
+        overall_risk = "Low"
+
+        for case in normalized_cases:
+            if str(case.get("source_type", "")).lower() == "post":
+                post_case = case
+            else:
+                comment_cases.append(case)
+
+            for law in case.get("matched_laws") or []:
+                if law not in matched_laws_all:
+                    matched_laws_all.append(law)
+
+            category = case.get("category")
+            if category and category not in categories:
+                categories.append(category)
+
+            if self._risk_value(case.get("risk_level")) > self._risk_value(
+                overall_risk
+            ):
+                overall_risk = case.get("risk_level", "Low")
+
+        violated_comments_legacy = [
+            {
+                "index": case.get("index"),
+                "content_snippet": case.get("quote", ""),
+                "quote": case.get("quote", ""),
+                "category": case.get("category", ""),
+                "reasoning": case.get("reasoning", ""),
+                "risk_level": case.get("risk_level", "Low"),
+                "primary_law": case.get("primary_law", ""),
+                "disposal_suggestion": case.get("disposal_suggestion", ""),
+            }
+            for case in comment_cases
+        ]
+
+        evidence_report = {
+            "violated_categories": categories,
+            "cited_laws": matched_laws_all[:5],
+            "evidence_chain": [case.get("quote", "") for case in normalized_cases[:5]],
+            "reasoning": "；".join(
+                [
+                    case.get("reasoning", "")
+                    for case in normalized_cases[:3]
+                    if case.get("reasoning")
+                ]
+            ),
+            "disposal_suggestion": "；".join(
+                [
+                    case.get("disposal_suggestion", "")
+                    for case in normalized_cases[:3]
+                    if case.get("disposal_suggestion")
+                ]
+            ),
+        }
 
         return {
-            "batch_result": batch_dict,
-            "matched_laws": matched_laws,
+            "is_post_violated": bool(post_case),
+            "category": (post_case or {}).get("category", ""),
+            "reasoning": (post_case or {}).get(
+                "reasoning", evidence_report["reasoning"]
+            ),
+            "post_case": post_case,
+            "comment_cases": comment_cases,
+            "overall_risk_level": overall_risk,
+            "matched_laws": matched_laws_all,
             "evidence_report": evidence_report,
+            "violated_comments": violated_comments_legacy,
+            "blocked_count": info.get("blocked_count", 0),
+        }
+
+    def audit_post_packet(
+        self, post_packet: Dict[str, Any], event_name: str = ""
+    ) -> Dict[str, Any]:
+        post_content = self._clean_text(post_packet.get("content"))
+        source_keyword = self._clean_text(post_packet.get("source_keyword"))
+        candidate_pool = self._build_candidate_pool(post_packet)
+
+        blocked_stage1_precheck = 0
+        suspects = [
+            {
+                "index": item.get("index", -1),
+                "category": "",
+                "reason_brief": "阶段1审核",
+            }
+            for item in candidate_pool
+        ]
+
+        final_cases, blocked_stage1 = self.finalize_candidates(
+            event_name=event_name,
+            source_keyword=source_keyword,
+            post_content=post_content,
+            candidate_pool=candidate_pool,
+            suspects=suspects,
+        )
+
+        confirmed_cases: List[Dict[str, Any]] = []
+        violation_cases = []
+        candidate_by_index: Dict[int, Dict[str, Any]] = {}
+        for item in candidate_pool:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index", -1))
+            except Exception:
+                continue
+            candidate_by_index[idx] = item
+        for case in final_cases:
+            try:
+                idx = int(case.get("index", -1))
+            except Exception:
+                continue
+            source_base = candidate_by_index.get(idx) or {}
+            case["source_type"] = source_base.get("source_type") or case.get(
+                "source_type", "comment"
+            )
+            case["source_id"] = str(
+                source_base.get("source_id") or case.get("source_id") or ""
+            )
+            case["content"] = source_base.get("content") or case.get("content", "")
+            case["category"] = self._canonicalize_category(
+                case.get("category", ""),
+                fallback=case.get("candidate_category", ""),
+            )
+            if (
+                case.get("is_violation")
+                and case.get("category")
+                and self._passes_violation_floor(case)
+            ):
+                violation_cases.append(case)
+        if violation_cases:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(self.LAW_MATCH_WORKERS, len(violation_cases))
+            ) as executor:
+                future_to_index = {
+                    executor.submit(self._match_laws_for_case, case): idx
+                    for idx, case in enumerate(violation_cases)
+                }
+                law_infos: List[Optional[Dict[str, Any]]] = [None] * len(
+                    violation_cases
+                )
+                for future in concurrent.futures.as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    try:
+                        law_infos[idx] = future.result()
+                    except Exception as e:
+                        logger.warning(
+                            f" [Agent C] 单条法条匹配失败，该条按不违规放行: {e}"
+                        )
+                        law_infos[idx] = None
+
+            for case, law_info in zip(violation_cases, law_infos):
+                safe_law_info = law_info or {
+                    "matched_laws": [],
+                    "primary_law": "",
+                    "law_reason": "法条匹配失败，该条按不违规放行。",
+                }
+                if not (safe_law_info.get("matched_laws") or []):
+                    continue
+
+                # 第二阶段：仅对已违规且已命中法规的条目补全证据链与处置建议。
+                enhanced_reasoning = case.get("reasoning", "")
+                enhanced_disposal = case.get("disposal_suggestion", "")
+                enhanced_chain = self._build_case_evidence_chain(case, safe_law_info)
+                merged_risk_level = self._derive_risk_level(case, safe_law_info)
+
+                def _apply_evidence_result(evidence_result):
+                    nonlocal enhanced_reasoning, enhanced_disposal, enhanced_chain
+                    enhanced_reasoning = (
+                        self._clean_text(getattr(evidence_result, "reasoning", ""))
+                        or enhanced_reasoning
+                    )
+                    enhanced_disposal = self._normalize_disposal_suggestion(
+                        getattr(evidence_result, "disposal_suggestion", "")
+                        or enhanced_disposal,
+                        merged_risk_level,
+                        True,
+                    )
+                    model_chain = getattr(evidence_result, "evidence_chain", []) or []
+                    if model_chain:
+                        enhanced_chain = [
+                            self._clean_text(x)
+                            for x in model_chain
+                            if self._clean_text(x)
+                        ]
+
+                try:
+                    evidence_result = self._invoke_evidence_chain(
+                        post_content=post_content,
+                        media_context=source_keyword,
+                        violated_items_json=json.dumps([case], ensure_ascii=False),
+                        laws_json=json.dumps(
+                            safe_law_info.get("matched_laws") or [],
+                            ensure_ascii=False,
+                        ),
+                    )
+                    _apply_evidence_result(evidence_result)
+                except Exception as e:
+                    if self._is_retryable_evidence_error(e):
+                        logger.warning(
+                            f" [Agent C] 证据链增强首次失败，准备重试一次: {e}"
+                        )
+                        try:
+                            retry_result = self._invoke_evidence_chain(
+                                post_content=post_content,
+                                media_context=source_keyword,
+                                violated_items_json=json.dumps(
+                                    [case], ensure_ascii=False
+                                ),
+                                laws_json=json.dumps(
+                                    safe_law_info.get("matched_laws") or [],
+                                    ensure_ascii=False,
+                                ),
+                            )
+                            _apply_evidence_result(retry_result)
+                            logger.info(" [Agent C] 证据链增强重试成功")
+                        except Exception as retry_error:
+                            logger.warning(
+                                " [Agent C] 证据链增强重试失败，已回退规则拼装: "
+                                f"{retry_error}"
+                            )
+                    else:
+                        logger.warning(
+                            " [Agent C] 证据链增强失败（非重试类），已回退规则拼装: "
+                            f"{e}"
+                        )
+
+                enhanced_disposal = self._normalize_disposal_suggestion(
+                    enhanced_disposal,
+                    merged_risk_level,
+                    True,
+                )
+
+                merged_case = {
+                    **case,
+                    **safe_law_info,
+                    "risk_level": merged_risk_level,
+                    "reasoning": enhanced_reasoning,
+                    "disposal_suggestion": enhanced_disposal,
+                    "evidence_chain": enhanced_chain,
+                }
+                confirmed_cases.append(merged_case)
+
+        post_case = None
+        comment_cases: List[Dict[str, Any]] = []
+        matched_laws_all: List[Dict[str, Any]] = []
+        categories: List[str] = []
+        overall_risk = "Low"
+
+        for case in confirmed_cases:
+            if case.get("source_type") == "post":
+                post_case = case
+            else:
+                comment_cases.append(case)
+            for law in case.get("matched_laws") or []:
+                if law not in matched_laws_all:
+                    matched_laws_all.append(law)
+            category = case.get("category")
+            if category and category not in categories:
+                categories.append(category)
+            if self._risk_value(case.get("risk_level")) > self._risk_value(
+                overall_risk
+            ):
+                overall_risk = case.get("risk_level", "Low")
+
+        violated_comments_legacy = [
+            {
+                "index": case.get("index"),
+                "content_snippet": case.get("quote", ""),
+                "quote": case.get("quote", ""),
+                "category": case.get("category", ""),
+                "reasoning": case.get("reasoning", ""),
+                "risk_level": case.get("risk_level", "Low"),
+                "primary_law": case.get("primary_law", ""),
+                "disposal_suggestion": case.get("disposal_suggestion", ""),
+            }
+            for case in comment_cases
+        ]
+
+        evidence_report = {
+            "violated_categories": categories,
+            "cited_laws": matched_laws_all[:5],
+            "evidence_chain": [case.get("quote", "") for case in confirmed_cases[:5]],
+            "reasoning": "；".join(
+                [
+                    case.get("reasoning", "")
+                    for case in confirmed_cases[:3]
+                    if case.get("reasoning")
+                ]
+            ),
+            "disposal_suggestion": "；".join(
+                [
+                    case.get("disposal_suggestion", "")
+                    for case in confirmed_cases[:3]
+                    if case.get("disposal_suggestion")
+                ]
+            ),
+        }
+
+        violation_info = {
+            "is_post_violated": bool(post_case),
+            "category": (post_case or {}).get("category", ""),
+            "reasoning": (post_case or {}).get(
+                "reasoning", evidence_report["reasoning"]
+            ),
+            "post_case": post_case,
+            "comment_cases": comment_cases,
+            "overall_risk_level": overall_risk,
+            "matched_laws": matched_laws_all,
+            "evidence_report": evidence_report,
+            "violated_comments": violated_comments_legacy,
+            "blocked_count": blocked_stage1_precheck + blocked_stage1,
+        }
+
+        return {
+            "is_violation": bool(post_case or comment_cases),
+            "violation_info": violation_info,
         }
 
 
-# 单例导出
 agent_c = AgentCompliance()
